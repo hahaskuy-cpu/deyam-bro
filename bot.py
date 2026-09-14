@@ -54,6 +54,12 @@ except Exception:
 #  CONFIGURATION & INSTITUTIONAL PARAMETERS
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ── Paper Trading Mode ─────────────────────────────────────────────────────
+# True = tidak ada order nyata, simulasi fill pakai harga live market
+# False = order nyata ke exchange (live trading)
+PAPER_TRADING = True
+# ──────────────────────────────────────────────────────────────────────────
+
 LEVERAGE      = 20
 ORDER_USDT    = 2.0
 MAX_POSITIONS = 3
@@ -908,35 +914,54 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     }
     with _lock: live_positions[sym] = pos
 
-    try: client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
-    except Exception: pass
+    if PAPER_TRADING:
+        # ── PAPER TRADING: tidak ada order nyata, simulasi fill pakai harga live ──
+        fill_px = price_live(sym)
+        if fill_px <= 0: fill_px = price
+        new_risk = DynamicRiskManager.calculate_levels(fill_px, execution_side, atr)
+        with _lock:
+            if sym in live_positions:
+                live_positions[sym].update({
+                    'entry': fill_px,
+                    'tp_pct': new_risk["tp_pct"],
+                    'sl_pct': new_risk["sl_pct"],
+                    'tp_price': new_risk["tp_price"],
+                    'sl_price': new_risk["sl_price"],
+                    'peak_price': fill_px
+                })
+        price = fill_px
+        print(f"         📝 [PAPER] ENTRY SIMULATED | fill:{price:.6g} | qty:{q_val} (no real order)")
+    else:
+        # ── LIVE TRADING: kirim order nyata ke exchange ──
+        try: client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
+        except Exception: pass
 
-    try:
-        # Eksekusi order menggunakan execution_side (bukan orig_direction)
-        order = client.futures_create_order(
-            symbol=sym, side='BUY' if execution_side == 'LONG' else 'SELL',
-            type='MARKET', quantity=q_val, newOrderRespType='RESULT'
-        )
-        real_px = get_real_fill_price(sym, order)
-        if real_px > 0:
-            price = real_px
-            # Hitung ulang level TP/SL berbasis harga fill sesungguhnya dan execution_side
-            new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
-            with _lock:
-                if sym in live_positions:
-                    live_positions[sym].update({
-                        'entry': price,
-                        'tp_pct': new_risk["tp_pct"],
-                        'sl_pct': new_risk["sl_pct"],
-                        'tp_price': new_risk["tp_price"],
-                        'sl_price': new_risk["sl_price"],
-                        'peak_price': price
-                    })
-        print(f"         ✅ ORDER #{order.get('orderId')} | fill:{price:.6g} | qty:{q_val}")
-    except Exception as e:
-        print(f"  ❌ ORDER GAGAL {sym}: {e}")
-        with _lock: live_positions.pop(sym, None)
-        return
+        try:
+            # Eksekusi order menggunakan execution_side (bukan orig_direction)
+            order = client.futures_create_order(
+                symbol=sym, side='BUY' if execution_side == 'LONG' else 'SELL',
+                type='MARKET', quantity=q_val, newOrderRespType='RESULT'
+            )
+            real_px = get_real_fill_price(sym, order)
+            if real_px > 0:
+                price = real_px
+                # Hitung ulang level TP/SL berbasis harga fill sesungguhnya dan execution_side
+                new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
+                with _lock:
+                    if sym in live_positions:
+                        live_positions[sym].update({
+                            'entry': price,
+                            'tp_pct': new_risk["tp_pct"],
+                            'sl_pct': new_risk["sl_pct"],
+                            'tp_price': new_risk["tp_price"],
+                            'sl_price': new_risk["sl_price"],
+                            'peak_price': price
+                        })
+            print(f"         ✅ ORDER #{order.get('orderId')} | fill:{price:.6g} | qty:{q_val}")
+        except Exception as e:
+            print(f"  ❌ ORDER GAGAL {sym}: {e}")
+            with _lock: live_positions.pop(sym, None)
+            return
 
     d = "🟢" if execution_side == "LONG" else "🔴"
     imb_str = f" | BAI:{order_book.get_imbalance(sym)*100:+.0f}%" if order_book.get_book(sym) else ""
@@ -956,24 +981,34 @@ def live_close(sym, reason, price=None):
 
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
 
-    try:
-        close_order = client.futures_create_order(
-            symbol=sym, side='SELL' if side == 'LONG' else 'BUY',
-            type='MARKET', quantity=q_val, reduceOnly=True, newOrderRespType='RESULT'
-        )
-        _api_ok()
-        real_px = get_real_fill_price(sym, close_order)
-        if real_px > 0:
-            price = real_px
+    if PAPER_TRADING:
+        # ── PAPER TRADING: tidak ada order nyata, simulasi close pakai harga live ──
+        fill_px = price_live(sym)
+        if fill_px > 0:
+            price = fill_px
         elif price == 0:
-            print(f"  ⚠️ {sym}: close terkirim tapi harga fill 0 — estimasi pakai entry")
             price = entry
-        print(f"         ✅ CLOSE ORDER #{close_order.get('orderId')} | fill:{price:.6g}")
-    except Exception as e:
-        _log_err(f"close_order_{sym}", e, cooldown=5)
-        print(f"  ⚠️ CLOSE ORDER GAGAL {sym}: {e}")
-        with _lock: live_positions[sym] = pos
-        return
+        print(f"         📝 [PAPER] CLOSE SIMULATED | fill:{price:.6g} (no real order)")
+    else:
+        # ── LIVE TRADING: kirim order close nyata ke exchange ──
+        try:
+            close_order = client.futures_create_order(
+                symbol=sym, side='SELL' if side == 'LONG' else 'BUY',
+                type='MARKET', quantity=q_val, reduceOnly=True, newOrderRespType='RESULT'
+            )
+            _api_ok()
+            real_px = get_real_fill_price(sym, close_order)
+            if real_px > 0:
+                price = real_px
+            elif price == 0:
+                print(f"  ⚠️ {sym}: close terkirim tapi harga fill 0 — estimasi pakai entry")
+                price = entry
+            print(f"         ✅ CLOSE ORDER #{close_order.get('orderId')} | fill:{price:.6g}")
+        except Exception as e:
+            _log_err(f"close_order_{sym}", e, cooldown=5)
+            print(f"  ⚠️ CLOSE ORDER GAGAL {sym}: {e}")
+            with _lock: live_positions[sym] = pos
+            return
 
     gross_pnl  = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
     fee_rate   = 0.0005
@@ -1375,12 +1410,12 @@ def t_ws_watchdog():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_bot():
+    mode_label = "📝 PAPER TRADING (no real orders)" if PAPER_TRADING else "🔴 LIVE TRADING (real orders sent)"
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  💎 BOT SCALPING v22.0 LIVE — RE-INVERTED (FLIP FROM LOSS MODE)    ║")
-    print("║  1. Signal LONG  -> Execute SHORT | Signal SHORT -> Execute LONG   ║")
-    print("║  2. TP = Jarak SL mode reverse (3.5x ATR)                          ║")
-    print("║  3. SL = Jarak TP mode reverse (1.8x ATR)                          ║")
-    print("║  4. Trailing Stop REMOVED | Tracking ATH PnL Enabled               ║")
+    print("║  💎 BOT SCALPING v22.0 — RE-INVERTED + PAPER TRADING MODE          ║")
+    print(f"║  Mode: {mode_label:<61}║")
+    print("║  Signal LONG → Eksekusi SHORT | Signal SHORT → Eksekusi LONG      ║")
+    print("║  TP = 3.5x ATR | SL = 1.8x ATR | Trailing Stop OFF                 ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try: valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
     except: valid = set(SYMBOLS)
