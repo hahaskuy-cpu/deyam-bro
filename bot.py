@@ -1,22 +1,13 @@
 """
-Bot Scalping v22.0 PAPER — INSTITUTIONAL QUANT ENGINE (Binance Futures)
+Bot Scalping v22.0 LIVE — INSTITUTIONAL QUANT ENGINE (Binance Futures)
 ====================================================================
-MODE: PAPER TRADING — REAL MARKET DATA, SIMULATED EXECUTION
-- Semua feed data (kline, order book, mark price, ticker, BTC aggTrade)
-  diambil LANGSUNG dari Binance Futures MAINNET (bukan testnet) supaya
-  strategi benar-benar mengikuti kondisi pasar asli.
-- TIDAK ADA order asli yang dikirim ke exchange. Setiap entry & exit
-  disimulasikan menggunakan harga bid/ask real-time + slippage acak
-  (dibatasi oleh SLIPPAGE_GUARD) supaya terasa seperti fill sungguhan.
-- Seluruh logika strategi (scoring, regime detection, absorption,
-  BTC macro veto, order book wall/spoof veto, dynamic TP/SL) TIDAK DIUBAH
-  dari v22.0 — hanya lapisan eksekusi yang diganti jadi simulasi.
+MODIFIKASI EKSPERIMEN: INVERT CURRENT LOSING MODE (ORIGINAL ENTRY & ORIGINAL TP/SL)
 - Signal Asli LONG  -> Eksekusi LONG
 - Signal Asli SHORT -> Eksekusi SHORT
 - Jarak TP = jarak SL mode reverse sebelumnya (3.5x ATR)
 - Jarak SL = jarak TP mode reverse sebelumnya (1.8x ATR)
 - Trailing Stop Dihapus Sepenuhnya
-- Tracking ATH PnL (Highest Peak Cumulative PnL) & simulated wallet balance
+- Penambahan Tracking ATH PnL (Highest Peak Cumulative PnL) pada Dashboard
 """
 
 import sys
@@ -30,8 +21,6 @@ if sys.platform == "win32":
 import os
 import time
 import math
-import random
-import itertools
 import threading
 import queue
 import numpy as np
@@ -47,31 +36,28 @@ from binance import ThreadedWebsocketManager
 import ta
 
 load_dotenv()
-# NOTE: Untuk mode PAPER TRADING, API_KEY/API_SECRET TIDAK WAJIB diisi.
-# Semua endpoint yang dipakai di bawah ini (klines, exchange_info, ticker,
-# depth, mark price, aggTrade) adalah endpoint PUBLIK — tidak butuh signature.
-# Tidak ada satupun order/akun endpoint yang dipanggil di mode ini.
-api_key = os.getenv("API_KEY", "")
-api_secret = os.getenv("API_SECRET", "")
+api_key = os.getenv("API_KEY")
+api_secret = os.getenv("API_SECRET")
 
-# PENTING: client TIDAK diarahkan ke testnet — supaya harga & order book
-# yang dipakai untuk simulasi benar-benar dari pasar Binance Futures asli.
-client = Client(api_key, api_secret)
+try:
+    client = Client(api_key, api_secret, testnet=True)
+except Exception:
+    client = Client(api_key, api_secret)
+client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
-twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret)
+try:
+    twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret, testnet=True)
+except Exception:
+    twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION & INSTITUTIONAL PARAMETERS
 # ═══════════════════════════════════════════════════════════════════════════
 
-PAPER_TRADING       = True     # Mode simulasi — tidak ada order asli ke exchange
-PAPER_START_BALANCE = 1000.0   # Saldo simulasi awal (USDT), hanya untuk display equity
-PAPER_FEE_RATE      = 0.0005   # Simulasi taker fee per side (sama seperti versi live)
-PAPER_FILL_LATENCY  = (0.05, 0.20)  # Simulasi delay matching engine (detik), realisme saja
-
 LEVERAGE      = 20
 ORDER_USDT    = 2.0
 MAX_POSITIONS = 3
+PAPER_TRADE   = True  # PAPER TRADE: tidak mengirim order ke Binance
 
 # Scanning & Concurrency
 SCAN_INTERVAL = 2.0
@@ -83,7 +69,7 @@ COOLDOWN_SEC  = 300   # 5 Menit jeda per simbol setelah close
 
 # Scoring & Filter
 MIN_SCORE      = 55
-SLIPPAGE_GUARD = 0.0015   # Dipakai sebagai batas atas slippage acak saat simulasi fill
+SLIPPAGE_GUARD = 0.0015
 TTL_5M         = 2
 
 # ── Dynamic Volatility Risk Management (ATR Multipliers) ───────────────────
@@ -157,7 +143,7 @@ class OrderBookEngine:
             asks = [(float(p), float(q)) for p, q in asks_raw]
             bids.sort(key=lambda x: x[0], reverse=True)
             asks.sort(key=lambda x: x[0])
-
+            
             bid_vol = sum(q for _, q in bids)
             ask_vol = sum(q for _, q in asks)
             tot_vol = bid_vol + ask_vol
@@ -231,7 +217,7 @@ class OrderBookEngine:
         with self._lock:
             hist = list(self._history.get(symbol, []))
         if len(hist) < 3: return False, ""
-
+        
         curr_ts, curr_b_vol, curr_a_vol, _, _ = hist[-1]
         for ts, b_vol, a_vol, _, _ in hist[:-1]:
             if 0.5 <= (curr_ts - ts) <= 2.5:
@@ -329,7 +315,7 @@ class AbsorptionDetector:
         """
         if df is None or len(df) < 25: return False, False, ""
         row = df.iloc[-2]
-
+        
         vol_spike = row.get("vr", 1.0) >= 1.4
         rng = row.get("rng", 1.0)
         low = row.get("low", 0.0)
@@ -441,7 +427,7 @@ class SignalWeights:
             "orderflow_delta_bull": 25, "orderflow_buy_high": 15,
             "absorption_bull": 35, "orderbook_imbalance_bull": 20,
             "rsi_bull_flow": 15, "rsi_extreme_ob": 10,
-
+            
             "ema_bear_stack": 30, "ema_mild_bear": 20, "ema_weak_bear": 12,
             "mom_strong_neg": 25, "mom_moderate_neg": 15,
             "macd_cross_down": 22, "macd_strengthen_neg": 15,
@@ -474,7 +460,7 @@ class SignalScorer:
     def get_signal(self, df: pd.DataFrame, symbol: str = None) -> Tuple[Optional[str], int, List[str], float, str, float]:
         if df is None or len(df) < 55:
             return None, 0, [], 0.0, "UNKNOWN", 0.0
-
+        
         regime, strength, bias = MarketRegime.detect(df)
         long_score, long_sigs = self._score_long(df, symbol)
         short_score, short_sigs = self._score_short(df, symbol)
@@ -660,9 +646,8 @@ MARKPRICE_FRESH_SEC = 10
 _macro = {"btc": "UNKNOWN"}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
-    "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0, "ath_pnl": 0.0,
-    "balance": PAPER_START_BALANCE,  # PAPER: saldo simulasi, update setiap posisi ditutup
-    "hard_sl": 0, "tp_exit": 0, "regime_block": 0,
+    "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0, "ath_pnl": 0.0, # TRAILING STOP REMOVED: ath_pnl ditambahkan
+    "hard_sl": 0, "tp_exit": 0, "regime_block": 0, # TRAILING STOP REMOVED: trail_exit dihapus
     "wall_veto": 0, "btc_breaker_veto": 0, "spoof_veto": 0, "absorb_entries": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
@@ -677,9 +662,6 @@ learning       = LearningLayer(signal_weights)
 _last_err_print   = defaultdict(float)
 _api_fail_streak = 0
 _api_ok_last      = time.time()
-
-# PAPER: counter untuk ID order simulasi, meniru response order ID dari exchange
-_paper_order_seq = itertools.count(700000000)
 
 def _log_err(tag, e, cooldown=10):
     now = time.time()
@@ -770,7 +752,7 @@ def _compute_indicators(df):
     df["e50"] = ta.trend.EMAIndicator(close, 50).ema_indicator()
     df["atr"] = ta.volatility.AverageTrueRange(high, low, close, 14).average_true_range()
     df["adx"] = ta.trend.ADXIndicator(high, low, close, 14).adx()
-
+    
     df["vm"]  = volume.rolling(20).mean()
     df["vr"]  = volume / df["vm"].replace(0, 1e-9)
 
@@ -857,39 +839,37 @@ def ks_upd(pnl):
     _ks["daily"] += pnl
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
+def get_real_fill_price(sym, order_resp):
+    try:
+        cum_quote = float(order_resp.get('cumQuote', 0))
+        exec_qty = float(order_resp.get('executedQty', 0))
+        if exec_qty > 0 and cum_quote > 0:
+            return cum_quote / exec_qty
+        avg_px = float(order_resp.get('avgPrice', 0))
+        if avg_px > 0:
+            return avg_px
+        order_id = order_resp.get('orderId')
+        if order_id:
+            for _ in range(2):
+                time.sleep(0.5)
+                info = client.futures_get_order(symbol=sym, orderId=order_id)
+                c_quote = float(info.get('cumQuote', 0))
+                e_qty = float(info.get('executedQty', 0))
+                if e_qty > 0 and c_quote > 0:
+                    return c_quote / e_qty
+                a_px = float(info.get('avgPrice', 0))
+                if a_px > 0:
+                    return a_px
+    except Exception:
+        pass
+    return 0.0
+
 # ═══════════════════════════════════════════════════════════════════════════
-#  5. PAPER EXECUTION ENGINE (SIMULATED FILLS, HARGA & ORDER BOOK ASLI)
+#  5. CORE EXECUTION & POSITION MONITORING
 # ═══════════════════════════════════════════════════════════════════════════
-#  Tidak ada order dikirim ke exchange. Fill disimulasikan memakai best
-#  bid/ask real-time dari OrderBookEngine (yang di-update oleh depth stream
-#  mainnet asli) ditambah slippage acak dibatasi SLIPPAGE_GUARD, supaya
-#  hasil eksekusi terasa realistis seperti market order sungguhan.
-# ═══════════════════════════════════════════════════════════════════════════
-
-def simulate_fill_price(sym: str, action_side: str, ref_price: float) -> float:
-    """
-    Simulasi harga fill sebuah market order berbasis order book real-time.
-    action_side = "BUY" atau "SELL" (arah order yang disimulasikan, bukan
-    arah posisi) — BUY market order fill di best ask, SELL fill di best bid.
-    """
-    book = order_book.get_book(sym)
-    if book and book.get("best_bid", 0) > 0 and book.get("best_ask", 0) > 0:
-        base_px = book["best_ask"] if action_side == "BUY" else book["best_bid"]
-    else:
-        base_px = ref_price
-
-    if base_px <= 0:
-        base_px = ref_price
-
-    slip = base_px * SLIPPAGE_GUARD * random.uniform(0.0, 1.0)
-    return base_px + slip if action_side == "BUY" else base_px - slip
-
-def paper_next_order_id() -> int:
-    return next(_paper_order_seq)
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
-    # v23 FIX: mode "ikut sinyal asli" terbukti loss (WR 11%, dominan TIME_LIMIT).
-    # Dibalik lagi: Signal LONG -> Eksekusi SHORT, Signal SHORT -> Eksekusi LONG.
+    # KEBALIKAN MODE LOSS SAAT INI: kembali mengikuti signal asli.
     if orig_direction == "LONG":
         execution_side = "SHORT"
     elif orig_direction == "SHORT":
@@ -906,7 +886,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         price = px_now
 
     try: q_val = qty(sym, price)
-    except:
+    except: 
         with _lock: live_positions.pop(sym, None)
         return
 
@@ -916,6 +896,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     tp_price = risk_profile["tp_price"]
     sl_price = risk_profile["sl_price"]
 
+    # TRAILING STOP REMOVED: Variabel trailing dihilangkan sepenuhnya
     pos = {
         "side": execution_side,             # Disimpan berbasis execution_side (setelah reverse)
         "orig_signal": orig_direction,      # Untuk tracking / log eksperimen
@@ -928,33 +909,56 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     }
     with _lock: live_positions[sym] = pos
 
-    # PAPER: simulasi latency matching engine (realisme saja, bukan order asli)
-    time.sleep(random.uniform(*PAPER_FILL_LATENCY))
-
-    # PAPER: fill disimulasikan dari order book real-time (BUY -> best ask, SELL -> best bid)
-    action_side = "BUY" if execution_side == "LONG" else "SELL"
-    fill_px = simulate_fill_price(sym, action_side, price)
-    order_id = paper_next_order_id()
-
-    if fill_px > 0:
-        price = fill_px
-        # Hitung ulang level TP/SL berbasis harga fill simulasi dan execution_side
+    if PAPER_TRADE:
+        # PAPER TRADE: tidak ada request create_order ke Binance.
+        # Harga entry virtual memakai harga pasar terbaru yang sudah didapat di atas.
+        order = {"orderId": "PAPER"}
         new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
         with _lock:
             if sym in live_positions:
                 live_positions[sym].update({
-                    'entry': price,
-                    'tp_pct': new_risk["tp_pct"],
-                    'sl_pct': new_risk["sl_pct"],
-                    'tp_price': new_risk["tp_price"],
-                    'sl_price': new_risk["sl_price"],
-                    'peak_price': price
+                    "entry": price,
+                    "tp_pct": new_risk["tp_pct"],
+                    "sl_pct": new_risk["sl_pct"],
+                    "tp_price": new_risk["tp_price"],
+                    "sl_price": new_risk["sl_price"],
+                    "peak_price": price
                 })
-    print(f"         ✅ [PAPER] ORDER #{order_id} | fill:{price:.6g} | qty:{q_val}")
+        print(f"         📝 PAPER ENTRY | fill:{price:.6g} | qty:{q_val}")
+    else:
+        try: client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
+        except Exception: pass
+
+        try:
+            # Eksekusi order menggunakan execution_side (bukan orig_direction)
+            order = client.futures_create_order(
+                symbol=sym, side='BUY' if execution_side == 'LONG' else 'SELL',
+                type='MARKET', quantity=q_val, newOrderRespType='RESULT'
+            )
+            real_px = get_real_fill_price(sym, order)
+            if real_px > 0:
+                price = real_px
+                # Hitung ulang level TP/SL berbasis harga fill sesungguhnya dan execution_side
+                new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
+                with _lock:
+                    if sym in live_positions:
+                        live_positions[sym].update({
+                            "entry": price,
+                            "tp_pct": new_risk["tp_pct"],
+                            "sl_pct": new_risk["sl_pct"],
+                            "tp_price": new_risk["tp_price"],
+                            "sl_price": new_risk["sl_price"],
+                            "peak_price": price
+                        })
+            print(f"         ✅ ORDER #{order.get('orderId')} | fill:{price:.6g} | qty:{q_val}")
+        except Exception as e:
+            print(f"  ❌ ORDER GAGAL {sym}: {e}")
+            with _lock: live_positions.pop(sym, None)
+            return
 
     d = "🟢" if execution_side == "LONG" else "🔴"
     imb_str = f" | BAI:{order_book.get_imbalance(sym)*100:+.0f}%" if order_book.get_book(sym) else ""
-    print(f"\n  {d} [PAPER v22] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% (dulu SL) | SL:{sl_pct*100:.2f}% (dulu TP){imb_str} | Regime:{regime}")
+    print(f"\n  {d} [PAPER INVERTED-BACK v22] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% (dulu SL) | SL:{sl_pct*100:.2f}% (dulu TP){imb_str} | Regime:{regime}")
     print(f"         Signals: {' | '.join(sigs[:6])}")
     _stats["trades"] += 1
     if any("Absorb" in s for s in sigs):
@@ -970,23 +974,33 @@ def live_close(sym, reason, price=None):
 
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
 
-    # PAPER: simulasi latency matching engine untuk close order
-    time.sleep(random.uniform(*PAPER_FILL_LATENCY))
-
-    # Menutup LONG = simulasi SELL market order (fill di best bid)
-    # Menutup SHORT = simulasi BUY market order (fill di best ask)
-    action_side = "SELL" if side == "LONG" else "BUY"
-    fill_px = simulate_fill_price(sym, action_side, price)
-    if fill_px > 0:
-        price = fill_px
-    elif price == 0:
-        price = entry
-
-    order_id = paper_next_order_id()
-    print(f"         ✅ [PAPER] CLOSE ORDER #{order_id} | fill:{price:.6g}")
+    if PAPER_TRADE:
+        # PAPER TRADE: tidak ada request reduceOnly/create_order ke Binance.
+        if price <= 0:
+            price = entry
+        print(f"         📝 PAPER CLOSE | fill:{price:.6g}")
+    else:
+        try:
+            close_order = client.futures_create_order(
+                symbol=sym, side='SELL' if side == 'LONG' else 'BUY',
+                type='MARKET', quantity=q_val, reduceOnly=True, newOrderRespType='RESULT'
+            )
+            _api_ok()
+            real_px = get_real_fill_price(sym, close_order)
+            if real_px > 0:
+                price = real_px
+            elif price == 0:
+                print(f"  ⚠️ {sym}: close terkirim tapi harga fill 0 — estimasi pakai entry")
+                price = entry
+            print(f"         ✅ CLOSE ORDER #{close_order.get('orderId')} | fill:{price:.6g}")
+        except Exception as e:
+            _log_err(f"close_order_{sym}", e, cooldown=5)
+            print(f"  ⚠️ CLOSE ORDER GAGAL {sym}: {e}")
+            with _lock: live_positions[sym] = pos
+            return
 
     gross_pnl  = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
-    fee_rate   = PAPER_FEE_RATE
+    fee_rate   = 0.0005
     total_fee  = (entry * q_val + price * q_val) * fee_rate
     pnl        = gross_pnl - total_fee
     pct        = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
@@ -997,7 +1011,7 @@ def live_close(sym, reason, price=None):
     peak_px  = pos.get("peak_price", entry)
     peak_pct = (peak_px - entry) / entry if side == "LONG" else (entry - peak_px) / entry
 
-    print(f"  {e_icon} [PAPER v22] {sym} {side} CLOSE — {reason} | peak:{peak_pct*100:+.3f}%")
+    print(f"  {e_icon} [PAPER INVERTED-BACK v22] {sym} {side} CLOSE — {reason} | peak:{peak_pct*100:+.3f}%")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
 
     trade = TradeRecord(
@@ -1010,8 +1024,8 @@ def live_close(sym, reason, price=None):
 
     _stats["pnl"] += pnl
     _stats["hist"].append(pnl)
-    _stats["balance"] += pnl  # PAPER: update saldo simulasi
-
+    
+    # TRACKING ATH PNL: Update PnL Tertinggi / ATH jika PnL kumulatif mencapai puncaknya
     if _stats["pnl"] > _stats["ath_pnl"]:
         _stats["ath_pnl"] = _stats["pnl"]
 
@@ -1024,6 +1038,7 @@ def live_close(sym, reason, price=None):
         _stats["losses"] += 1
         if pnl < _stats["worst"]: _stats["worst"] = pnl
 
+    # TRAILING STOP REMOVED: Hapus pencatatan exit karena trailing
     if "SL" in reason: _stats["hard_sl"] += 1
     elif "TP" in reason: _stats["tp_exit"] += 1
 
@@ -1088,8 +1103,13 @@ def scan_one(sym):
         orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
         if orig_direction is None: return None
 
-        # v23 FIX: dibalik lagi mengikuti live_open (LONG signal -> SHORT eksekusi, dst).
-        execution_side = "SHORT" if orig_direction == "LONG" else "LONG"
+        # HANYA MEMBALIK ENTRY: analisis/orig_signal tetap tidak diubah.
+        if orig_direction == "LONG":
+            execution_side = "SHORT"
+        elif orig_direction == "SHORT":
+            execution_side = "LONG"
+        else:
+            return None
 
         px_live = price_live(sym)
         if px_live == 0: return None
@@ -1157,7 +1177,8 @@ def print_inline():
     aw = learning.avg_win()
     avg_pk = learning.avg_peak_win()
     e = "💚" if pnl >= 0 else "🔴"
-    print(f"       ┌ [PAPER v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U) | Bal:{_stats['balance']:.2f}U")
+    # TRAILING STOP REMOVED: Tampilan log ringkas diperbarui
+    print(f"       ┌ [PAPER INVERTED-BACK v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
     print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Absorb:{_stats['absorb_entries']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
 
 def print_full():
@@ -1169,13 +1190,13 @@ def print_full():
     e = "💚" if pnl >= 0 else "🔴"
     aw, al = learning.avg_win(), learning.avg_loss()
     bep = al / (al + aw) * 100 if (al + aw) > 0 else 50
-    roi = (_stats["balance"] - PAPER_START_BALANCE) / PAPER_START_BALANCE * 100 if PAPER_START_BALANCE > 0 else 0
 
     print(f"\n  {'─'*72}")
-    print(f"    🔔 INSTITUTIONAL SCALPING v22 PAPER TRADING DASHBOARD")
+    print(f"    🔔 INSTITUTIONAL SCALPING v22 PAPER DASHBOARD (INVERTED-BACK MODE)")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
+    # ADDED ATH PNL: Menampilkan PnL Kumulatif Tertinggi (ATH PnL)
     print(f"    {e} PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U | Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"    💰 Saldo Simulasi:{_stats['balance']:.2f}U (mulai {PAPER_START_BALANCE:.2f}U, ROI:{roi:+.2f}%)")
+    # TRAILING STOP REMOVED: Log exit dashboard tanpa trailing stop
     print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']}")
     print(f"    🛡️ Veto Stats: Wall Veto:{_stats['wall_veto']} | BTC Breaker:{_stats['btc_breaker_veto']} | Spoof:{_stats['spoof_veto']}")
     print(f"    ⚡ Absorption Entries: {_stats['absorb_entries']} | BEP WR:{bep:.1f}%")
@@ -1268,7 +1289,7 @@ def t_macro():
         time.sleep(10)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  7. WEBSOCKET HANDLERS & WATCHDOG (SEMUA FEED = MAINNET ASLI)
+#  7. WEBSOCKET HANDLERS & WATCHDOG
 # ═══════════════════════════════════════════════════════════════════════════
 
 def handle_all_ticker(msg):
@@ -1351,8 +1372,18 @@ def handle_depth_multiplex(msg):
     except Exception as e:
         _log_err("handle_depth_multiplex", e)
 
+def handle_user_data(msg):
+    try:
+        etype = msg.get("e")
+        if etype == "ORDER_TRADE_UPDATE":
+            o = msg.get("o", {})
+            if o.get("X") in ("FILLED", "PARTIALLY_FILLED", "CANCELED", "EXPIRED"):
+                print(f"  📡 [WS ORDER] {o.get('s')} {o.get('S')} {o.get('X')} qty={o.get('z')} avgPx={o.get('ap')}")
+    except Exception as e:
+        _log_err("handle_user_data", e)
+
 def bootstrap_all_klines(syms):
-    print(f"  📥 Bootstrap history awal ({len(syms)} simbol) via REST (mainnet)...")
+    print(f"  📥 Bootstrap history awal ({len(syms)} simbol) via REST...")
     futs = {_executor.submit(_bootstrap_klines, s, Client.KLINE_INTERVAL_5MINUTE, 100): s for s in syms}
     ok = 0
     for f in as_completed(futs, timeout=90):
@@ -1374,13 +1405,11 @@ def t_ws_watchdog():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  💎 BOT SCALPING v22.0 PAPER TRADING — REAL MARKET DATA             ║")
-    print("║  🚫 TIDAK ADA ORDER ASLI YANG DIKIRIM KE EXCHANGE                    ║")
-    print("║  📡 Semua data (kline/depth/mark price/ticker/BTC) dari MAINNET asli║")
+    print("║  💎 BOT SCALPING v22.0 LIVE — INVERTED-BACK TRADING EXPERIMENT     ║")
     print("║  1. Signal LONG  -> Execute LONG | Signal SHORT -> Execute SHORT   ║")
     print("║  2. TP = Jarak SL mode reverse (3.5x ATR)                          ║")
     print("║  3. SL = Jarak TP mode reverse (1.8x ATR)                          ║")
-    print("║  4. Trailing Stop REMOVED | Tracking ATH PnL & Saldo Simulasi      ║")
+    print("║  4. Trailing Stop REMOVED | Tracking ATH PnL Enabled               ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try: valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
     except: valid = set(SYMBOLS)
@@ -1391,16 +1420,19 @@ def run_bot():
     twm.start()
     twm.start_all_mark_price_socket(callback=handle_mark_price, fast=True)
     twm.start_futures_multiplex_socket(callback=handle_all_ticker, streams=["!ticker@arr"])
-
+    
     kline_streams = [f"{s.lower()}@kline_5m" for s in syms]
     twm.start_futures_multiplex_socket(callback=handle_kline_multiplex, streams=kline_streams)
-
+    
     twm.start_futures_multiplex_socket(callback=handle_btc_aggtrade, streams=["btcusdt@aggtrade"])
-
+    
     depth_streams = [f"{s.lower()}@depth10" for s in syms]
     twm.start_futures_multiplex_socket(callback=handle_depth_multiplex, streams=depth_streams)
 
-    # PAPER: user data socket (order/akun real) TIDAK dipakai — tidak ada order asli.
+    try:
+        twm.start_futures_user_socket(callback=handle_user_data)
+    except Exception as e:
+        _log_err("user_data_stream_start", e, cooldown=0)
 
     threading.Thread(target=t_ws_watchdog, daemon=True).start()
     threading.Thread(target=t_monitor, daemon=True).start()
@@ -1409,7 +1441,7 @@ def run_bot():
     threading.Thread(target=t_macro, daemon=True).start()
     time.sleep(2)
     tickers_all()
-
+    
     cycle = 0
     while True:
         cycle += 1
@@ -1422,7 +1454,7 @@ def run_bot():
         btc_status = btc_macro.get_status_str()
         veto_summary = f"Veto[Wall:{_stats['wall_veto']}|BTC:{_stats['btc_breaker_veto']}|Spoof:{_stats['spoof_veto']}]"
 
-        print(f"  #{cycle} {time.strftime('%H:%M:%S')} [PAPER] BTC_5M:{_macro['btc']} ({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U) Bal:{_stats['balance']:.2f}U | {veto_summary}{api_flag}{ws_flag}")
+        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC_5M:{_macro['btc']} ({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U) | {veto_summary}{api_flag}{ws_flag}")
         print(f"        ↳ {btc_status}")
 
         if (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}")
