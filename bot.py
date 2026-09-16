@@ -43,7 +43,7 @@ try:
     client = Client(api_key, api_secret)
 except Exception:
     client = Client(api_key, api_secret)
-client.FUTURES_URL = "https://fapi.binance.com"
+client.FUTURES_URL = "https://fapi.binance.com/fapi"
 
 try:
     twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret)
@@ -59,12 +59,19 @@ ORDER_USDT    = 2.0
 MAX_POSITIONS = 3
 
 # Scanning & Concurrency
-SCAN_INTERVAL = 2.0
+SCAN_INTERVAL = 4.0
 MONITOR_INT   = 0.1
-BATCH_SIZE    = 15
-MAX_WORKERS   = 5
-SLOT_FILL_INT = 0.01
+BATCH_SIZE    = 8
+MAX_WORKERS   = 2
+SLOT_FILL_INT = 0.25
 COOLDOWN_SEC  = 300   # 5 Menit jeda per simbol setelah close
+
+# ── REST API SAFETY / ANTI-403 ───────────────────────────────────────────────
+REST_MIN_INTERVAL = 0.20       # jeda minimum antar request REST dari proses ini
+REST_403_COOLDOWN = 300.0      # jangan spam API setelah WAF 403
+REST_429_COOLDOWN = 60.0       # backoff setelah rate-limit 429
+REST_418_COOLDOWN = 900.0      # backoff konservatif setelah auto-ban 418
+REST_RETRIES = 2
 
 # Scoring & Filter
 MIN_SCORE      = 55
@@ -661,6 +668,9 @@ learning       = LearningLayer(signal_weights)
 _last_err_print   = defaultdict(float)
 _api_fail_streak = 0
 _api_ok_last      = time.time()
+_rest_lock = threading.Lock()
+_rest_last_ts = 0.0
+_rest_block_until = 0.0
 
 def _log_err(tag, e, cooldown=10):
     now = time.time()
@@ -686,10 +696,66 @@ def _api_fail(tag):
         idle = time.time() - _api_ok_last
         print(f"  🚨 API GAGAL BERUNTUN {_api_fail_streak}x (idle {idle:.0f}s) — trigger: {tag}")
 
+def _rest_call(tag, fn, *args, retries=REST_RETRIES, **kwargs):
+    """Serialize REST calls, back off on 403/429/418, and avoid request bursts."""
+    global _rest_last_ts, _rest_block_until
+
+    last_exc = None
+    for attempt in range(retries + 1):
+        with _rest_lock:
+            wait = max(0.0, _rest_block_until - time.time())
+            if wait > 0:
+                time.sleep(wait)
+            now = time.time()
+            gap = now - _rest_last_ts
+            if gap < REST_MIN_INTERVAL:
+                time.sleep(REST_MIN_INTERVAL - gap)
+            _rest_last_ts = time.time()
+
+        try:
+            result = fn(*args, **kwargs)
+            _api_ok()
+            return result
+        except Exception as e:
+            last_exc = e
+            msg = str(e).upper()
+            now = time.time()
+
+            if "403" in msg or "REQUEST BLOCKED" in msg or "CLOUDFRONT" in msg:
+                _rest_block_until = max(_rest_block_until, now + REST_403_COOLDOWN)
+                _log_warn("REST_403", f"[{tag}] Binance WAF 403 — REST dihentikan {REST_403_COOLDOWN:.0f}s", cooldown=30)
+                _api_fail(f"{tag}_403")
+                if attempt >= retries:
+                    break
+                continue
+
+            if "418" in msg:
+                _rest_block_until = max(_rest_block_until, now + REST_418_COOLDOWN)
+                _log_warn("REST_418", f"[{tag}] IP ban 418 — REST dihentikan {REST_418_COOLDOWN:.0f}s", cooldown=30)
+                _api_fail(f"{tag}_418")
+                break
+
+            if "429" in msg or "TOO MANY REQUESTS" in msg:
+                _rest_block_until = max(_rest_block_until, now + REST_429_COOLDOWN)
+                _log_warn("REST_429", f"[{tag}] rate limit 429 — backoff {REST_429_COOLDOWN:.0f}s", cooldown=30)
+                _api_fail(f"{tag}_429")
+                if attempt >= retries:
+                    break
+                continue
+
+            _api_fail(tag)
+            if attempt < retries:
+                time.sleep(min(2.0, 0.5 * (2 ** attempt)))
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"REST call failed: {tag}")
+
+
 def get_precision(symbol):
     if symbol in _precision_cache: return _precision_cache[symbol]
     try:
-        info = client.futures_exchange_info()
+        info = _rest_call("futures_exchange_info", client.futures_exchange_info)
         for s in info['symbols']:
             if s['symbol'] == symbol:
                 prec = int(s['quantityPrecision'])
@@ -710,7 +776,7 @@ def price_live(symbol):
         if px > 0 and (time.time() - ts) < MARKPRICE_FRESH_SEC:
             return px
     try:
-        px = float(client.futures_symbol_ticker(symbol=symbol)["price"])
+        px = float(_rest_call(f"price_live_{symbol}", client.futures_symbol_ticker, symbol=symbol)["price"])
         _api_ok()
         _log_warn(f"price_live_ws_miss_{symbol}", "fallback REST — data mark price WS kosong/basi", cooldown=30)
         return px
@@ -726,7 +792,7 @@ def tickers_all():
         return _ws_ticker_cache
     if now - _ticker_ts < 2 and _ticker_cache: return _ticker_cache
     try:
-        raw = client.futures_ticker()
+        raw = _rest_call("futures_ticker", client.futures_ticker)
         _ticker_cache = {t["symbol"]: {"pct": float(t["priceChangePercent"]), "vol": float(t["quoteVolume"]), "last": float(t["lastPrice"])} for t in raw}
         _ticker_ts = now
         _api_ok()
@@ -781,7 +847,7 @@ def run_ta(df):
 
 def _bootstrap_klines(symbol, interval, limit=100):
     try:
-        kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        kl = _rest_call(f"bootstrap_klines_{symbol}", client.futures_klines, symbol=symbol, interval=interval, limit=limit)
         df = pd.DataFrame(kl, columns=["time","open","high","low","close","volume","ct","qv","trades","tbbase","tbquote","ignore"])
         for c in ["open","high","low","close","volume","tbbase","tbquote"]: df[c] = df[c].astype(float)
         df = _compute_indicators(df)
@@ -851,7 +917,7 @@ def get_real_fill_price(sym, order_resp):
         if order_id:
             for _ in range(2):
                 time.sleep(0.5)
-                info = client.futures_get_order(symbol=sym, orderId=order_id)
+                info = _rest_call(f"get_order_{sym}", client.futures_get_order, symbol=sym, orderId=order_id)
                 c_quote = float(info.get('cumQuote', 0))
                 e_qty = float(info.get('executedQty', 0))
                 if e_qty > 0 and c_quote > 0:
@@ -908,12 +974,12 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     }
     with _lock: live_positions[sym] = pos
 
-    try: client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
+    try: _rest_call(f"leverage_{sym}", client.futures_change_leverage, symbol=sym, leverage=LEVERAGE)
     except Exception: pass
 
     try:
         # Eksekusi order menggunakan execution_side (bukan orig_direction)
-        order = client.futures_create_order(
+        order = _rest_call(f"open_order_{sym}", client.futures_create_order,
             symbol=sym, side='BUY' if execution_side == 'LONG' else 'SELL',
             type='MARKET', quantity=q_val, newOrderRespType='RESULT'
         )
@@ -957,7 +1023,7 @@ def live_close(sym, reason, price=None):
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
 
     try:
-        close_order = client.futures_create_order(
+        close_order = _rest_call(f"close_order_{sym}", client.futures_create_order,
             symbol=sym, side='SELL' if side == 'LONG' else 'BUY',
             type='MARKET', quantity=q_val, reduceOnly=True, newOrderRespType='RESULT'
         )
@@ -1359,20 +1425,23 @@ def handle_user_data(msg):
         _log_err("handle_user_data", e)
 
 def bootstrap_all_klines(syms):
-    print(f"  📥 Bootstrap history awal ({len(syms)} simbol) via REST...")
-    futs = {_executor.submit(_bootstrap_klines, s, Client.KLINE_INTERVAL_5MINUTE, 100): s for s in syms}
+    print(f"  📥 Bootstrap history awal ({len(syms)} simbol) via REST — paced/anti-403...")
     ok = 0
-    for f in as_completed(futs, timeout=90):
+    for i, s in enumerate(syms, 1):
         try:
-            if f.result(timeout=15) is not None: ok += 1
-        except Exception: pass
+            if _bootstrap_klines(s, Client.KLINE_INTERVAL_5MINUTE, 100) is not None:
+                ok += 1
+        except Exception as e:
+            _log_err(f"bootstrap_all_{s}", e, cooldown=30)
+        if i < len(syms):
+            time.sleep(REST_MIN_INTERVAL)
     print(f"  ✅ Bootstrap selesai: {ok}/{len(syms)} simbol siap dipantau")
 
 def t_ws_watchdog():
     while True:
         idle = time.time() - _ws_last_msg_ts
         if idle > WS_STALE_SEC:
-            print(f"  🚨 WEBSOCKET DIAM {idle:.0f}s — tidak ada data masuk. Fallback otomatis ke REST aktif.")
+            print(f"  🚨 WEBSOCKET DIAM {idle:.0f}s — tidak ada data masuk. REST fallback dibatasi oleh rate limiter/backoff.")
         time.sleep(10)
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1382,12 +1451,12 @@ def t_ws_watchdog():
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
     print("║  💎 BOT SCALPING v22.0 LIVE — INVERTED-BACK TRADING EXPERIMENT     ║")
-    print("║  1. Signal LONG  -> Execute LONG | Signal SHORT -> Execute SHORT   ║")
+    print("║  1. Signal LONG  -> Execute SHORT | Signal SHORT -> Execute LONG  ║")
     print("║  2. TP = Jarak SL mode reverse (3.5x ATR)                          ║")
     print("║  3. SL = Jarak TP mode reverse (1.8x ATR)                          ║")
     print("║  4. Trailing Stop REMOVED | Tracking ATH PnL Enabled               ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
-    try: valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
+    try: valid = {s["symbol"] for s in _rest_call("startup_exchange_info", client.futures_exchange_info)["symbols"] if s["status"] == "TRADING"}
     except: valid = set(SYMBOLS)
     syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
 
