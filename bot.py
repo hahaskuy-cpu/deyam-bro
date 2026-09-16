@@ -57,7 +57,6 @@ except Exception:
 LEVERAGE      = 20
 ORDER_USDT    = 2.0
 MAX_POSITIONS = 3
-PAPER_TRADE   = True  # PAPER TRADE: tidak mengirim order ke Binance
 
 # Scanning & Concurrency
 SCAN_INTERVAL = 2.0
@@ -81,8 +80,8 @@ ATR_SL_RESTORED_MULTIPLIER = 1.8
 
 MIN_TP_PCT        = 0.025
 MAX_TP_PCT        = 0.035
-MIN_SL_PCT        = 0.015
-MAX_SL_PCT        = 0.025
+MIN_SL_PCT        = 0.025
+MAX_SL_PCT        = 0.035
 MAX_HOLD_SECONDS  = 6120   # 3 Jam batas maksimal tahan posisi
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -909,56 +908,39 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     }
     with _lock: live_positions[sym] = pos
 
-    if PAPER_TRADE:
-        # PAPER TRADE: tidak ada request create_order ke Binance.
-        # Harga entry virtual memakai harga pasar terbaru yang sudah didapat di atas.
-        order = {"orderId": "PAPER"}
-        new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
-        with _lock:
-            if sym in live_positions:
-                live_positions[sym].update({
-                    "entry": price,
-                    "tp_pct": new_risk["tp_pct"],
-                    "sl_pct": new_risk["sl_pct"],
-                    "tp_price": new_risk["tp_price"],
-                    "sl_price": new_risk["sl_price"],
-                    "peak_price": price
-                })
-        print(f"         📝 PAPER ENTRY | fill:{price:.6g} | qty:{q_val}")
-    else:
-        try: client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
-        except Exception: pass
+    try: client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
+    except Exception: pass
 
-        try:
-            # Eksekusi order menggunakan execution_side (bukan orig_direction)
-            order = client.futures_create_order(
-                symbol=sym, side='BUY' if execution_side == 'LONG' else 'SELL',
-                type='MARKET', quantity=q_val, newOrderRespType='RESULT'
-            )
-            real_px = get_real_fill_price(sym, order)
-            if real_px > 0:
-                price = real_px
-                # Hitung ulang level TP/SL berbasis harga fill sesungguhnya dan execution_side
-                new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
-                with _lock:
-                    if sym in live_positions:
-                        live_positions[sym].update({
-                            "entry": price,
-                            "tp_pct": new_risk["tp_pct"],
-                            "sl_pct": new_risk["sl_pct"],
-                            "tp_price": new_risk["tp_price"],
-                            "sl_price": new_risk["sl_price"],
-                            "peak_price": price
-                        })
-            print(f"         ✅ ORDER #{order.get('orderId')} | fill:{price:.6g} | qty:{q_val}")
-        except Exception as e:
-            print(f"  ❌ ORDER GAGAL {sym}: {e}")
-            with _lock: live_positions.pop(sym, None)
-            return
+    try:
+        # Eksekusi order menggunakan execution_side (bukan orig_direction)
+        order = client.futures_create_order(
+            symbol=sym, side='BUY' if execution_side == 'LONG' else 'SELL',
+            type='MARKET', quantity=q_val, newOrderRespType='RESULT'
+        )
+        real_px = get_real_fill_price(sym, order)
+        if real_px > 0:
+            price = real_px
+            # Hitung ulang level TP/SL berbasis harga fill sesungguhnya dan execution_side
+            new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
+            with _lock:
+                if sym in live_positions:
+                    live_positions[sym].update({
+                        'entry': price,
+                        'tp_pct': new_risk["tp_pct"],
+                        'sl_pct': new_risk["sl_pct"],
+                        'tp_price': new_risk["tp_price"],
+                        'sl_price': new_risk["sl_price"],
+                        'peak_price': price
+                    })
+        print(f"         ✅ ORDER #{order.get('orderId')} | fill:{price:.6g} | qty:{q_val}")
+    except Exception as e:
+        print(f"  ❌ ORDER GAGAL {sym}: {e}")
+        with _lock: live_positions.pop(sym, None)
+        return
 
     d = "🟢" if execution_side == "LONG" else "🔴"
     imb_str = f" | BAI:{order_book.get_imbalance(sym)*100:+.0f}%" if order_book.get_book(sym) else ""
-    print(f"\n  {d} [PAPER INVERTED-BACK v22] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% (dulu SL) | SL:{sl_pct*100:.2f}% (dulu TP){imb_str} | Regime:{regime}")
+    print(f"\n  {d} [INVERTED-BACK ENGINE v22] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% (dulu SL) | SL:{sl_pct*100:.2f}% (dulu TP){imb_str} | Regime:{regime}")
     print(f"         Signals: {' | '.join(sigs[:6])}")
     _stats["trades"] += 1
     if any("Absorb" in s for s in sigs):
@@ -974,30 +956,24 @@ def live_close(sym, reason, price=None):
 
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
 
-    if PAPER_TRADE:
-        # PAPER TRADE: tidak ada request reduceOnly/create_order ke Binance.
-        if price <= 0:
+    try:
+        close_order = client.futures_create_order(
+            symbol=sym, side='SELL' if side == 'LONG' else 'BUY',
+            type='MARKET', quantity=q_val, reduceOnly=True, newOrderRespType='RESULT'
+        )
+        _api_ok()
+        real_px = get_real_fill_price(sym, close_order)
+        if real_px > 0:
+            price = real_px
+        elif price == 0:
+            print(f"  ⚠️ {sym}: close terkirim tapi harga fill 0 — estimasi pakai entry")
             price = entry
-        print(f"         📝 PAPER CLOSE | fill:{price:.6g}")
-    else:
-        try:
-            close_order = client.futures_create_order(
-                symbol=sym, side='SELL' if side == 'LONG' else 'BUY',
-                type='MARKET', quantity=q_val, reduceOnly=True, newOrderRespType='RESULT'
-            )
-            _api_ok()
-            real_px = get_real_fill_price(sym, close_order)
-            if real_px > 0:
-                price = real_px
-            elif price == 0:
-                print(f"  ⚠️ {sym}: close terkirim tapi harga fill 0 — estimasi pakai entry")
-                price = entry
-            print(f"         ✅ CLOSE ORDER #{close_order.get('orderId')} | fill:{price:.6g}")
-        except Exception as e:
-            _log_err(f"close_order_{sym}", e, cooldown=5)
-            print(f"  ⚠️ CLOSE ORDER GAGAL {sym}: {e}")
-            with _lock: live_positions[sym] = pos
-            return
+        print(f"         ✅ CLOSE ORDER #{close_order.get('orderId')} | fill:{price:.6g}")
+    except Exception as e:
+        _log_err(f"close_order_{sym}", e, cooldown=5)
+        print(f"  ⚠️ CLOSE ORDER GAGAL {sym}: {e}")
+        with _lock: live_positions[sym] = pos
+        return
 
     gross_pnl  = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
     fee_rate   = 0.0005
@@ -1011,7 +987,7 @@ def live_close(sym, reason, price=None):
     peak_px  = pos.get("peak_price", entry)
     peak_pct = (peak_px - entry) / entry if side == "LONG" else (entry - peak_px) / entry
 
-    print(f"  {e_icon} [PAPER INVERTED-BACK v22] {sym} {side} CLOSE — {reason} | peak:{peak_pct*100:+.3f}%")
+    print(f"  {e_icon} [INVERTED-BACK ENGINE v22] {sym} {side} CLOSE — {reason} | peak:{peak_pct*100:+.3f}%")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
 
     trade = TradeRecord(
@@ -1178,7 +1154,7 @@ def print_inline():
     avg_pk = learning.avg_peak_win()
     e = "💚" if pnl >= 0 else "🔴"
     # TRAILING STOP REMOVED: Tampilan log ringkas diperbarui
-    print(f"       ┌ [PAPER INVERTED-BACK v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
+    print(f"       ┌ [INVERTED-BACK ENGINE v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
     print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Absorb:{_stats['absorb_entries']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
 
 def print_full():
@@ -1192,7 +1168,7 @@ def print_full():
     bep = al / (al + aw) * 100 if (al + aw) > 0 else 50
 
     print(f"\n  {'─'*72}")
-    print(f"    🔔 INSTITUTIONAL SCALPING v22 PAPER DASHBOARD (INVERTED-BACK MODE)")
+    print(f"    🔔 INSTITUTIONAL SCALPING v22 LIVE DASHBOARD (INVERTED-BACK MODE)")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     # ADDED ATH PNL: Menampilkan PnL Kumulatif Tertinggi (ATH PnL)
     print(f"    {e} PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U | Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
