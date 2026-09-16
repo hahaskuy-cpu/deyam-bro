@@ -40,13 +40,13 @@ api_key = os.getenv("API_KEY")
 api_secret = os.getenv("API_SECRET")
 
 try:
-    client = Client(api_key, api_secret, testnet=True)
+    client = Client(api_key, api_secret)
 except Exception:
     client = Client(api_key, api_secret)
-client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+client.FUTURES_URL = "https://fapi.binance.com"
 
 try:
-    twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret, testnet=True)
+    twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret)
 except Exception:
     twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret)
 
