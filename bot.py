@@ -59,11 +59,12 @@ ORDER_USDT    = 2.0
 MAX_POSITIONS = 3
 
 # Scanning & Concurrency
-SCAN_INTERVAL = 4.0
+# STRATEGY BASELINE = PAPER VERSION YANG TERBUKTI +2.95U
+SCAN_INTERVAL = 2.0
 MONITOR_INT   = 0.1
-BATCH_SIZE    = 8
-MAX_WORKERS   = 2
-SLOT_FILL_INT = 0.25
+BATCH_SIZE    = 15
+MAX_WORKERS   = 5
+SLOT_FILL_INT = 0.01
 COOLDOWN_SEC  = 300   # 5 Menit jeda per simbol setelah close
 
 # ── REST API SAFETY / ANTI-403 ───────────────────────────────────────────────
@@ -87,8 +88,8 @@ ATR_SL_RESTORED_MULTIPLIER = 1.8
 
 MIN_TP_PCT        = 0.025
 MAX_TP_PCT        = 0.035
-MIN_SL_PCT        = 0.025
-MAX_SL_PCT        = 0.035
+MIN_SL_PCT        = 0.015
+MAX_SL_PCT        = 0.025
 MAX_HOLD_SECONDS  = 6120   # 3 Jam batas maksimal tahan posisi
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -671,6 +672,10 @@ _api_ok_last      = time.time()
 _rest_lock = threading.Lock()
 _rest_last_ts = 0.0
 _rest_block_until = 0.0
+_rest_price_cache = {}
+_rest_ticker_stale_until = 0.0
+_leverage_done = set()
+_order_state_uncertain = False
 
 def _log_err(tag, e, cooldown=10):
     now = time.time()
@@ -696,8 +701,8 @@ def _api_fail(tag):
         idle = time.time() - _api_ok_last
         print(f"  🚨 API GAGAL BERUNTUN {_api_fail_streak}x (idle {idle:.0f}s) — trigger: {tag}")
 
-def _rest_call(tag, fn, *args, retries=REST_RETRIES, **kwargs):
-    """Serialize REST calls, back off on 403/429/418, and avoid request bursts."""
+def _rest_call(tag, fn, *args, retries=1, **kwargs):
+    """REST gate: serialize requests, honor WAF/rate-limit backoff, avoid bursts."""
     global _rest_last_ts, _rest_block_until
 
     last_exc = None
@@ -706,8 +711,7 @@ def _rest_call(tag, fn, *args, retries=REST_RETRIES, **kwargs):
             wait = max(0.0, _rest_block_until - time.time())
             if wait > 0:
                 time.sleep(wait)
-            now = time.time()
-            gap = now - _rest_last_ts
+            gap = time.time() - _rest_last_ts
             if gap < REST_MIN_INTERVAL:
                 time.sleep(REST_MIN_INTERVAL - gap)
             _rest_last_ts = time.time()
@@ -723,15 +727,13 @@ def _rest_call(tag, fn, *args, retries=REST_RETRIES, **kwargs):
 
             if "403" in msg or "REQUEST BLOCKED" in msg or "CLOUDFRONT" in msg:
                 _rest_block_until = max(_rest_block_until, now + REST_403_COOLDOWN)
-                _log_warn("REST_403", f"[{tag}] Binance WAF 403 — REST dihentikan {REST_403_COOLDOWN:.0f}s", cooldown=30)
+                _log_warn("REST_403", f"[{tag}] WAF 403 — REST pause {REST_403_COOLDOWN:.0f}s", cooldown=30)
                 _api_fail(f"{tag}_403")
-                if attempt >= retries:
-                    break
-                continue
+                break
 
             if "418" in msg:
                 _rest_block_until = max(_rest_block_until, now + REST_418_COOLDOWN)
-                _log_warn("REST_418", f"[{tag}] IP ban 418 — REST dihentikan {REST_418_COOLDOWN:.0f}s", cooldown=30)
+                _log_warn("REST_418", f"[{tag}] IP ban 418 — REST pause {REST_418_COOLDOWN:.0f}s", cooldown=30)
                 _api_fail(f"{tag}_418")
                 break
 
@@ -739,9 +741,7 @@ def _rest_call(tag, fn, *args, retries=REST_RETRIES, **kwargs):
                 _rest_block_until = max(_rest_block_until, now + REST_429_COOLDOWN)
                 _log_warn("REST_429", f"[{tag}] rate limit 429 — backoff {REST_429_COOLDOWN:.0f}s", cooldown=30)
                 _api_fail(f"{tag}_429")
-                if attempt >= retries:
-                    break
-                continue
+                break
 
             _api_fail(tag)
             if attempt < retries:
@@ -751,6 +751,57 @@ def _rest_call(tag, fn, *args, retries=REST_RETRIES, **kwargs):
         raise last_exc
     raise RuntimeError(f"REST call failed: {tag}")
 
+def _new_client_order_id(prefix, sym):
+    return f"IV22_{prefix}_{sym}_{int(time.time()*1000)%1000000000}"[:32]
+
+def _create_market_order_safe(sym, side, quantity, reduce_only=False):
+    """Tidak me-retry POST order; gunakan clientOrderId untuk verifikasi bila perlu."""
+    global _order_state_uncertain
+    cid = _new_client_order_id("C" if reduce_only else "O", sym)
+    kwargs = {
+        "symbol": sym,
+        "side": side,
+        "type": "MARKET",
+        "quantity": quantity,
+        "newOrderRespType": "RESULT",
+        "newClientOrderId": cid,
+    }
+    if reduce_only:
+        kwargs["reduceOnly"] = True
+
+    try:
+        return _rest_call(f"create_order_{sym}", client.futures_create_order, retries=0, **kwargs)
+    except Exception as first_exc:
+        text = str(first_exc).upper()
+        # 403/429/418 are rejected by the API/WAF layer; do not duplicate the POST.
+        if "403" in text or "429" in text or "418" in text or "CLOUDFRONT" in text:
+            raise
+
+        # For ambiguous network/5xx errors, query by clientOrderId exactly once.
+        try:
+            time.sleep(0.5)
+            found = _rest_call(
+                f"verify_order_{sym}",
+                client.futures_get_order,
+                symbol=sym,
+                origClientOrderId=cid,
+                retries=0,
+            )
+            if found:
+                return found
+        except Exception:
+            pass
+
+        _order_state_uncertain = True
+        raise RuntimeError(f"ORDER STATUS UNKNOWN {sym} clientOrderId={cid}: {first_exc}") from first_exc
+
+def _get_order_fill(order):
+    try:
+        filled = float(order.get("executedQty", 0) or 0)
+        avg_px = float(order.get("avgPrice", 0) or 0)
+        return filled, avg_px
+    except Exception:
+        return 0.0, 0.0
 
 def get_precision(symbol):
     if symbol in _precision_cache: return _precision_cache[symbol]
@@ -775,10 +826,16 @@ def price_live(symbol):
         px, ts = cached
         if px > 0 and (time.time() - ts) < MARKPRICE_FRESH_SEC:
             return px
+
+    now = time.time()
+    old = _rest_price_cache.get(symbol)
+    if old and (now - old[1]) < 1.0:
+        return old[0]
+
     try:
         px = float(_rest_call(f"price_live_{symbol}", client.futures_symbol_ticker, symbol=symbol)["price"])
-        _api_ok()
-        _log_warn(f"price_live_ws_miss_{symbol}", "fallback REST — data mark price WS kosong/basi", cooldown=30)
+        _rest_price_cache[symbol] = (px, time.time())
+        _log_warn(f"price_live_ws_miss_{symbol}", "fallback REST — mark price WS kosong/basi", cooldown=30)
         return px
     except Exception as e:
         _log_err(f"price_live_{symbol}", e)
@@ -790,13 +847,20 @@ def tickers_all():
     now = time.time()
     if _ws_ticker_cache and (now - _ws_ticker_ts) < 15:
         return _ws_ticker_cache
-    if now - _ticker_ts < 2 and _ticker_cache: return _ticker_cache
+    # REST fallback dibatasi; strategi tetap sama saat WS sehat.
+    if _ticker_cache and (now - _ticker_ts) < 15:
+        return _ticker_cache
     try:
-        raw = _rest_call("futures_ticker", client.futures_ticker)
-        _ticker_cache = {t["symbol"]: {"pct": float(t["priceChangePercent"]), "vol": float(t["quoteVolume"]), "last": float(t["lastPrice"])} for t in raw}
+        raw = _rest_call("futures_ticker", client.futures_ticker, retries=1)
+        _ticker_cache = {
+            t["symbol"]: {
+                "pct": float(t["priceChangePercent"]),
+                "vol": float(t["quoteVolume"]),
+                "last": float(t["lastPrice"])
+            } for t in raw
+        }
         _ticker_ts = now
-        _api_ok()
-        _log_warn("tickers_all_ws_miss", "fallback REST — data ticker WS kosong/basi", cooldown=30)
+        _log_warn("tickers_all_ws_miss", "fallback REST — ticker WS kosong/basi", cooldown=30)
     except Exception as e:
         _log_err("tickers_all", e)
         _api_fail("tickers_all")
@@ -888,6 +952,8 @@ def ohlcv(symbol, interval, limit=100):
 
 def ks_check():
     k, now = _ks, time.time()
+    if _order_state_uncertain:
+        return True, "ORDER_STATE_UNKNOWN — entry baru dihentikan"
     if k["active"] and now >= k["resume"]: k["active"], k["consec"] = False, 0
     if k["active"]: return True, k["reason"]
     day = now - (now % 86400)
@@ -934,7 +1000,7 @@ def get_real_fill_price(sym, order_resp):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
-    # KEBALIKAN MODE LOSS SAAT INI: kembali mengikuti signal asli.
+    # KEBALIKAN ENTRY: ANALISIS TETAP ASLI, ORDER DIBALIK.
     if orig_direction == "LONG":
         execution_side = "SHORT"
     elif orig_direction == "SHORT":
@@ -950,21 +1016,23 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     if px_now > 0:
         price = px_now
 
-    try: q_val = qty(sym, price)
-    except: 
+    try:
+        q_val = qty(sym, price)
+        if q_val <= 0:
+            raise ValueError("quantity <= 0")
+    except Exception as e:
+        _log_err(f"qty_{sym}", e)
         with _lock: live_positions.pop(sym, None)
         return
 
-    # RESTORED TP/SL: Perhitungan TP & SL baru berbasis execution_side
     tp_pct   = risk_profile["tp_pct"]
     sl_pct   = risk_profile["sl_pct"]
     tp_price = risk_profile["tp_price"]
     sl_price = risk_profile["sl_price"]
 
-    # TRAILING STOP REMOVED: Variabel trailing dihilangkan sepenuhnya
     pos = {
-        "side": execution_side,             # Disimpan berbasis execution_side (setelah reverse)
-        "orig_signal": orig_direction,      # Untuk tracking / log eksperimen
+        "side": execution_side,
+        "orig_signal": orig_direction,
         "entry": price, "qty": q_val,
         "open_time": time.time(), "score": score, "sigs": sigs,
         "atr": atr, "regime": regime, "bias": bias,
@@ -974,31 +1042,44 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     }
     with _lock: live_positions[sym] = pos
 
-    try: _rest_call(f"leverage_{sym}", client.futures_change_leverage, symbol=sym, leverage=LEVERAGE)
-    except Exception: pass
+    # Set leverage sekali per symbol per proses.
+    if sym not in _leverage_done:
+        try:
+            _rest_call(f"leverage_{sym}", client.futures_change_leverage, symbol=sym, leverage=LEVERAGE, retries=0)
+            _leverage_done.add(sym)
+        except Exception as e:
+            _log_err(f"leverage_{sym}", e)
+            with _lock: live_positions.pop(sym, None)
+            return
 
     try:
-        # Eksekusi order menggunakan execution_side (bukan orig_direction)
-        order = _rest_call(f"open_order_{sym}", client.futures_create_order,
-            symbol=sym, side='BUY' if execution_side == 'LONG' else 'SELL',
-            type='MARKET', quantity=q_val, newOrderRespType='RESULT'
+        order = _create_market_order_safe(
+            sym,
+            'BUY' if execution_side == 'LONG' else 'SELL',
+            q_val,
+            reduce_only=False,
         )
-        real_px = get_real_fill_price(sym, order)
-        if real_px > 0:
-            price = real_px
-            # Hitung ulang level TP/SL berbasis harga fill sesungguhnya dan execution_side
-            new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
-            with _lock:
-                if sym in live_positions:
-                    live_positions[sym].update({
-                        'entry': price,
-                        'tp_pct': new_risk["tp_pct"],
-                        'sl_pct': new_risk["sl_pct"],
-                        'tp_price': new_risk["tp_price"],
-                        'sl_price': new_risk["sl_price"],
-                        'peak_price': price
-                    })
-        print(f"         ✅ ORDER #{order.get('orderId')} | fill:{price:.6g} | qty:{q_val}")
+        filled_qty, real_px = _get_order_fill(order)
+        if filled_qty <= 0:
+            raise RuntimeError(f"ORDER TIDAK FILLED: {sym} status={order.get('status')}")
+        if real_px <= 0:
+            real_px = price
+
+        price = real_px
+        new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
+        with _lock:
+            if sym in live_positions:
+                live_positions[sym].update({
+                    "entry": price,
+                    "qty": filled_qty,
+                    "tp_pct": new_risk["tp_pct"],
+                    "sl_pct": new_risk["sl_pct"],
+                    "tp_price": new_risk["tp_price"],
+                    "sl_price": new_risk["sl_price"],
+                    "peak_price": price
+                })
+
+        print(f"         ✅ ORDER #{order.get('orderId')} | {execution_side} | fill:{price:.6g} | qty:{filled_qty:.8g}")
     except Exception as e:
         print(f"  ❌ ORDER GAGAL {sym}: {e}")
         with _lock: live_positions.pop(sym, None)
@@ -1006,7 +1087,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
 
     d = "🟢" if execution_side == "LONG" else "🔴"
     imb_str = f" | BAI:{order_book.get_imbalance(sym)*100:+.0f}%" if order_book.get_book(sym) else ""
-    print(f"\n  {d} [INVERTED-BACK ENGINE v22] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% (dulu SL) | SL:{sl_pct*100:.2f}% (dulu TP){imb_str} | Regime:{regime}")
+    print(f"\n  {d} [LIVE PAPER-BASELINE INVERTED v22] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% | SL:{sl_pct*100:.2f}%{imb_str} | Regime:{regime}")
     print(f"         Signals: {' | '.join(sigs[:6])}")
     _stats["trades"] += 1
     if any("Absorb" in s for s in sigs):
@@ -1021,20 +1102,25 @@ def live_close(sym, reason, price=None):
         price = price_live(sym)
 
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
+    if q_val <= 0:
+        with _lock: live_positions[sym] = pos
+        return
 
     try:
-        close_order = _rest_call(f"close_order_{sym}", client.futures_create_order,
-            symbol=sym, side='SELL' if side == 'LONG' else 'BUY',
-            type='MARKET', quantity=q_val, reduceOnly=True, newOrderRespType='RESULT'
+        close_order = _create_market_order_safe(
+            sym,
+            'SELL' if side == 'LONG' else 'BUY',
+            q_val,
+            reduce_only=True,
         )
-        _api_ok()
-        real_px = get_real_fill_price(sym, close_order)
+        filled_qty, real_px = _get_order_fill(close_order)
         if real_px > 0:
             price = real_px
-        elif price == 0:
-            print(f"  ⚠️ {sym}: close terkirim tapi harga fill 0 — estimasi pakai entry")
+        if price <= 0:
             price = entry
-        print(f"         ✅ CLOSE ORDER #{close_order.get('orderId')} | fill:{price:.6g}")
+        if filled_qty > 0 and filled_qty < q_val:
+            q_val = filled_qty
+        print(f"         ✅ CLOSE ORDER #{close_order.get('orderId')} | fill:{price:.6g} | qty:{q_val:.8g}")
     except Exception as e:
         _log_err(f"close_order_{sym}", e, cooldown=5)
         print(f"  ⚠️ CLOSE ORDER GAGAL {sym}: {e}")
@@ -1424,6 +1510,31 @@ def handle_user_data(msg):
     except Exception as e:
         _log_err("handle_user_data", e)
 
+def preflight_account(syms):
+    """Validasi dasar agar bot tidak start dalam kondisi yang mudah menyebabkan mismatch posisi."""
+    try:
+        info = _rest_call("preflight_account", client.futures_account, retries=0)
+        if not isinstance(info, dict):
+            raise RuntimeError("response futures_account tidak valid")
+    except Exception as e:
+        raise RuntimeError(f"API/account check gagal: {e}") from e
+
+    try:
+        positions = _rest_call("preflight_positions", client.futures_position_information, retries=0)
+        active = []
+        wanted = set(syms)
+        for p in positions or []:
+            sym = p.get("symbol")
+            amt = float(p.get("positionAmt", 0) or 0)
+            if sym in wanted and abs(amt) > 0:
+                active.append((sym, amt))
+        if active:
+            raise RuntimeError(f"Masih ada posisi Futures terbuka pada bot symbols: {active}. Tutup/sinkronkan dulu sebelum start.")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"position check gagal: {e}") from e
+
 def bootstrap_all_klines(syms):
     print(f"  📥 Bootstrap history awal ({len(syms)} simbol) via REST — paced/anti-403...")
     ok = 0
@@ -1452,13 +1563,16 @@ def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
     print("║  💎 BOT SCALPING v22.0 LIVE — INVERTED-BACK TRADING EXPERIMENT     ║")
     print("║  1. Signal LONG  -> Execute SHORT | Signal SHORT -> Execute LONG  ║")
-    print("║  2. TP = Jarak SL mode reverse (3.5x ATR)                          ║")
-    print("║  3. SL = Jarak TP mode reverse (1.8x ATR)                          ║")
+    print("║  2. TP = 2.5–3.5% (paper baseline / 3.5x ATR capped)              ║")
+    print("║  3. SL = 1.5–2.5% (paper baseline / 1.8x ATR capped)              ║")
     print("║  4. Trailing Stop REMOVED | Tracking ATH PnL Enabled               ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
-    try: valid = {s["symbol"] for s in _rest_call("startup_exchange_info", client.futures_exchange_info)["symbols"] if s["status"] == "TRADING"}
-    except: valid = set(SYMBOLS)
+    try:
+        valid = {s["symbol"] for s in _rest_call("startup_exchange_info", client.futures_exchange_info, retries=0)["symbols"] if s["status"] == "TRADING"}
+    except Exception as e:
+        raise RuntimeError(f"Gagal membaca exchangeInfo REAL: {e}") from e
     syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
+    preflight_account(syms)
 
     bootstrap_all_klines(syms)
 
@@ -1509,4 +1623,9 @@ def run_bot():
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
-    run_bot()
+    try:
+        run_bot()
+    except KeyboardInterrupt:
+        print("\n🛑 Bot dihentikan manual.")
+    except Exception as e:
+        print(f"\n❌ BOT STARTUP STOP: {type(e).__name__}: {e}")
