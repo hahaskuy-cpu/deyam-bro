@@ -56,7 +56,7 @@ except Exception:
 
 LEVERAGE      = 20
 ORDER_USDT    = 2.0
-MAX_POSITIONS = 3
+MAX_POSITIONS = 2
 
 # ── SL CIRCUIT BAN / LOSS LIQUIDATION ───────────────────────────────────────
 SL_BAN_SECONDS = 3 * 60 * 60      # 3 jam tidak membuka posisi baru setelah SL
