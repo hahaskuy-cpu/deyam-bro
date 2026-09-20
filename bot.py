@@ -56,7 +56,7 @@ except Exception:
 
 LEVERAGE      = 20
 ORDER_USDT    = 2.0
-MAX_POSITIONS = 2
+MAX_POSITIONS = 3
 
 # ── SL CIRCUIT BAN / LOSS LIQUIDATION ───────────────────────────────────────
 SL_BAN_SECONDS = 3 * 60 * 60      # 3 jam tidak membuka posisi baru setelah SL
@@ -93,8 +93,6 @@ MIN_TP_PCT        = 0.025
 MAX_TP_PCT        = 0.035
 MIN_SL_PCT        = 0.015
 MAX_SL_PCT        = 0.025
-TRAIL_ACTIVATE_PCT = 0.0003   # +0.03% floating profit before trailing activates
-TRAIL_WIDTH_PCT    = 0.0006   # 0.06% below/above peak
 MAX_HOLD_SECONDS  = 6120   # 3 Jam batas maksimal tahan posisi
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -359,7 +357,7 @@ class AbsorptionDetector:
         return bull_absorb, bear_absorb, " ".join(details)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  4. VOLATILITY-ADJUSTED RISK MANAGEMENT (NORMAL TP/SL + TRAILING)
+#  4. VOLATILITY-ADJUSTED RISK MANAGEMENT (NORMAL TP/SL, NO TRAILING)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class DynamicRiskManager:
@@ -655,8 +653,8 @@ MARKPRICE_FRESH_SEC = 10
 _macro = {"btc": "UNKNOWN"}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
-    "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0, "ath_pnl": 0.0,
-    "hard_sl": 0, "tp_exit": 0, "trail_exit": 0, "regime_block": 0,
+    "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0, "ath_pnl": 0.0, # TRAILING STOP REMOVED: ath_pnl ditambahkan
+    "hard_sl": 0, "tp_exit": 0, "regime_block": 0, # TRAILING STOP REMOVED: trail_exit dihapus
     "wall_veto": 0, "btc_breaker_veto": 0, "spoof_veto": 0, "absorb_entries": 0,
     "hist": deque(maxlen=200), "start": time.time(),
     "sl_ban_count": 0, "sl_cascade_closes": 0,
@@ -1181,7 +1179,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
 
     d = "🟢" if execution_side == "LONG" else "🔴"
     imb_str = f" | BAI:{order_book.get_imbalance(sym)*100:+.0f}%" if order_book.get_book(sym) else ""
-    print(f"\n  {d} [LIVE NORMAL v22 + TRAILING] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% | SL:{sl_pct*100:.2f}%{imb_str} | Regime:{regime}")
+    print(f"\n  {d} [LIVE PAPER-BASELINE NORMAL v22] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% | SL:{sl_pct*100:.2f}%{imb_str} | Regime:{regime}")
     print(f"         Signals: {' | '.join(sigs[:6])}")
     _stats["trades"] += 1
     if any("Absorb" in s for s in sigs):
@@ -1233,7 +1231,7 @@ def live_close(sym, reason, price=None):
     peak_px  = pos.get("peak_price", entry)
     peak_pct = (peak_px - entry) / entry if side == "LONG" else (entry - peak_px) / entry
 
-    print(f"  {e_icon} [NORMAL ENGINE v22 + TRAILING] {sym} {side} CLOSE — {reason} | peak:{peak_pct*100:+.3f}%")
+    print(f"  {e_icon} [NORMAL ENGINE v22] {sym} {side} CLOSE — {reason} | peak:{peak_pct*100:+.3f}%")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
 
     trade = TradeRecord(
@@ -1260,9 +1258,9 @@ def live_close(sym, reason, price=None):
         _stats["losses"] += 1
         if pnl < _stats["worst"]: _stats["worst"] = pnl
 
+    # TRAILING STOP REMOVED: Hapus pencatatan exit karena trailing
     if "SL" in reason: _stats["hard_sl"] += 1
     elif "TP" in reason: _stats["tp_exit"] += 1
-    elif "TRAILING" in reason: _stats["trail_exit"] += 1
 
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7), "exit": round(price, 7),
@@ -1306,29 +1304,13 @@ def monitor_positions():
         else:
             if px < pos["peak_price"]: pos["peak_price"] = px
 
-        # TP / SL normal + trailing stop berbasis peak price.
-        peak_gain = ((pos["peak_price"] - pos["entry"]) / pos["entry"]
-                     if side == "LONG" else
-                     (pos["entry"] - pos["peak_price"]) / pos["entry"])
-
+        # RESTORED TP/SL & NO TRAILING: Monitoring HANYA menggunakan TP Baru, SL Baru, dan Time Limit
         if side == "LONG":
-            if px >= tp_px:
-                live_close(sym, "TP", tp_px); continue
-            if px <= sl_px:
-                live_close(sym, "SL", sl_px); continue
-            if peak_gain >= TRAIL_ACTIVATE_PCT:
-                trail_px = pos["peak_price"] * (1 - TRAIL_WIDTH_PCT)
-                if px <= trail_px:
-                    live_close(sym, "TRAILING_STOP", trail_px); continue
+            if px >= tp_px: live_close(sym, "TP", tp_px); continue
+            if px <= sl_px: live_close(sym, "SL", sl_px); continue
         elif side == "SHORT":
-            if px <= tp_px:
-                live_close(sym, "TP", tp_px); continue
-            if px >= sl_px:
-                live_close(sym, "SL", sl_px); continue
-            if peak_gain >= TRAIL_ACTIVATE_PCT:
-                trail_px = pos["peak_price"] * (1 + TRAIL_WIDTH_PCT)
-                if px >= trail_px:
-                    live_close(sym, "TRAILING_STOP", trail_px); continue
+            if px <= tp_px: live_close(sym, "TP", tp_px); continue
+            if px >= sl_px: live_close(sym, "SL", sl_px); continue
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  6. SCANNER THREAD & HARD VETO FILTERS
@@ -1417,8 +1399,9 @@ def print_inline():
     aw = learning.avg_win()
     avg_pk = learning.avg_peak_win()
     e = "💚" if pnl >= 0 else "🔴"
-    print(f"       ┌ [NORMAL ENGINE v22 + TRAILING] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
-    print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Trail:{_stats['trail_exit']} Absorb:{_stats['absorb_entries']} | SL-Ban:{_stats['sl_ban_count']} Cascade:{_stats['sl_cascade_closes']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
+    # TRAILING STOP REMOVED: Tampilan log ringkas diperbarui
+    print(f"       ┌ [NORMAL ENGINE v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
+    print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Absorb:{_stats['absorb_entries']} | SL-Ban:{_stats['sl_ban_count']} Cascade:{_stats['sl_cascade_closes']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -1431,11 +1414,12 @@ def print_full():
     bep = al / (al + aw) * 100 if (al + aw) > 0 else 50
 
     print(f"\n  {'─'*72}")
-    print(f"    🔔 INSTITUTIONAL SCALPING v22 LIVE DASHBOARD (NORMAL + TRAILING MODE)")
+    print(f"    🔔 INSTITUTIONAL SCALPING v22 LIVE DASHBOARD (NORMAL MODE)")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     # ADDED ATH PNL: Menampilkan PnL Kumulatif Tertinggi (ATH PnL)
     print(f"    {e} PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U | Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | Trail:{_stats['trail_exit']}")
+    # TRAILING STOP REMOVED: Log exit dashboard tanpa trailing stop
+    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']}")
     sl_status = _sl_ban_status()
     print(f"    🛑 SL Circuit: {sl_status if sl_status else 'READY'} | Bans:{_stats['sl_ban_count']} | Cascade Close:{_stats['sl_cascade_closes']}")
     print(f"    🛡️ Veto Stats: Wall Veto:{_stats['wall_veto']} | BTC Breaker:{_stats['btc_breaker_veto']} | Spoof:{_stats['spoof_veto']}")
