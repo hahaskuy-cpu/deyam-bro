@@ -1,13 +1,17 @@
 """
 Bot Scalping v22.0 LIVE — INSTITUTIONAL QUANT ENGINE (Binance Futures)
 ====================================================================
-MODIFIKASI EKSPERIMEN: INVERT CURRENT LOSING MODE (ORIGINAL ENTRY & ORIGINAL TP/SL)
+MODE NORMAL + CAPITAL PROTECTION
 - Signal Asli LONG  -> Eksekusi LONG
 - Signal Asli SHORT -> Eksekusi SHORT
 - TP = 3.5x ATR (clamped 2.5%-3.5%)
 - SL = 1.8x ATR (clamped 1.5%-2.5%)
 - Trailing Stop Dihapus Sepenuhnya
-- Penambahan Tracking ATH PnL (Highest Peak Cumulative PnL) pada Dashboard
+- SL = ban 3 jam + liquidate posisi lain yang sedang floating loss
+- CASCADE_AFTER_SL = ban tambahan 1 jam (tidak memperpanjang SL 3 jam)
+- TIME_LIMIT = ban 1 jam
+- Profit Guard berbasis ATH PnL untuk mencegah giveback besar
+- Signal Flip Exit: cut setelah candle 5m closed mengonfirmasi arah berlawanan kuat
 """
 
 import sys
@@ -58,9 +62,25 @@ LEVERAGE      = 20
 ORDER_USDT    = 2.0
 MAX_POSITIONS = 2
 
-# ── SL CIRCUIT BAN / LOSS LIQUIDATION ───────────────────────────────────────
-SL_BAN_SECONDS = 3 * 60 * 60      # 3 jam tidak membuka posisi baru setelah SL
-SL_LIQUIDATE_LOSERS = True        # Saat SL: tutup posisi lain yang sedang floating loss
+# ── LOSS CIRCUIT / LOSS LIQUIDATION ────────────────────────────────────────
+SL_BAN_SECONDS = 3 * 60 * 60          # 3 jam setelah SL asli
+CASCADE_BAN_SECONDS = 1 * 60 * 60      # 1 jam setelah CASCADE_AFTER_SL
+TIME_LIMIT_BAN_SECONDS = 1 * 60 * 60   # 1 jam setelah TIME_LIMIT
+SL_LIQUIDATE_LOSERS = True             # Saat SL: tutup posisi lain yang floating loss
+
+# ── PROFIT GUARD / ATH GIVEBACK PROTECTION ──────────────────────────────────
+PROFIT_GUARD_ENABLED = True
+PROFIT_GUARD_ARM_PNL = 1.50             # Guard mulai bisa aktif setelah cumulative PnL >= +1.50U
+PROFIT_GUARD_GIVEBACK_MIN = 1.00        # Minimal giveback yang ditoleransi dari ATH
+PROFIT_GUARD_GIVEBACK_PCT = 0.30        # atau 30% dari ATH, ambil yang lebih besar
+PROFIT_GUARD_BAN_SECONDS = 2 * 60 * 60  # 2 jam blok entry baru
+PROFIT_GUARD_CLOSE_LOSERS = True       # Saat guard aktif, close posisi lain yang floating loss
+
+# ── SIGNAL FLIP EXIT ────────────────────────────────────────────────────────
+SIGNAL_FLIP_EXIT_ENABLED = True
+SIGNAL_FLIP_MIN_SCORE = 65              # Harus lebih kuat dari MIN_SCORE normal
+SIGNAL_FLIP_CONFIRM_CANDLES = 1         # 1 candle 5m closed berlawanan sudah cukup
+SIGNAL_FLIP_MIN_HOLD_SECONDS = 90       # Hindari cut akibat noise tepat setelah entry
 
 # Scanning & Concurrency
 # STRATEGY BASELINE = PAPER VERSION YANG TERBUKTI +2.95U
@@ -658,6 +678,8 @@ _stats = {
     "wall_veto": 0, "btc_breaker_veto": 0, "spoof_veto": 0, "absorb_entries": 0,
     "hist": deque(maxlen=200), "start": time.time(),
     "sl_ban_count": 0, "sl_cascade_closes": 0,
+    "cascade_ban_count": 0, "time_limit_ban_count": 0,
+    "profit_guard_count": 0, "signal_flip_exits": 0,
 }
 
 live_positions = {}
@@ -681,6 +703,14 @@ _sl_ban_lock = threading.Lock()
 _sl_ban_until = 0.0
 _sl_ban_reason = ""
 _sl_ban_trigger = ""
+_cascade_ban_until = 0.0
+_cascade_ban_trigger = ""
+_time_limit_ban_until = 0.0
+_time_limit_ban_trigger = ""
+_profit_guard_until = 0.0
+_profit_guard_trigger = ""
+_profit_guard_triggered_ath = 0.0
+_profit_guard_in_progress = False
 _sl_cascade_close_count = 0
 
 def _log_err(tag, e, cooldown=10):
@@ -956,19 +986,69 @@ def ohlcv(symbol, interval, limit=100):
     if df is not None: return df
     return _bootstrap_klines(symbol, interval, limit)
 
+def _fmt_ban(label: str, remaining: float) -> str:
+    if remaining <= 0:
+        return ""
+    h = int(remaining // 3600)
+    m = int((remaining % 3600) // 60)
+    sec = int(remaining % 60)
+    return f"{label} {h:02d}:{m:02d}:{sec:02d}"
+
 def _sl_ban_remaining():
     with _sl_ban_lock:
         rem = _sl_ban_until - time.time()
         return max(0.0, rem)
 
+def _circuit_snapshot():
+    now = time.time()
+    with _sl_ban_lock:
+        items = [
+            ("SL_BAN", max(0.0, _sl_ban_until - now)),
+            ("CASCADE_BAN", max(0.0, _cascade_ban_until - now)),
+            ("TIME_BAN", max(0.0, _time_limit_ban_until - now)),
+            ("PROFIT_GUARD", max(0.0, _profit_guard_until - now)),
+        ]
+    active = [(name, rem) for name, rem in items if rem > 0]
+    if not active:
+        return "", 0.0
+    name, rem = max(active, key=lambda x: x[1])
+    return _fmt_ban(name, rem), rem
+
 def _sl_ban_status():
     rem = _sl_ban_remaining()
-    if rem <= 0:
-        return ""
-    h = int(rem // 3600)
-    m = int((rem % 3600) // 60)
-    s = int(rem % 60)
-    return f"SL_BAN {h:02d}:{m:02d}:{s:02d}"
+    return _fmt_ban("SL_BAN", rem)
+
+def _activate_aux_ban(kind: str, seconds: float, trigger_sym: str):
+    global _cascade_ban_until, _cascade_ban_trigger
+    global _time_limit_ban_until, _time_limit_ban_trigger
+    global _profit_guard_until, _profit_guard_trigger
+
+    until = time.time() + seconds
+    with _sl_ban_lock:
+        if kind == "CASCADE":
+            _cascade_ban_until = max(_cascade_ban_until, until)
+            _cascade_ban_trigger = trigger_sym
+            _stats["cascade_ban_count"] += 1
+            label = "CASCADE_BAN"
+        elif kind == "TIME_LIMIT":
+            _time_limit_ban_until = max(_time_limit_ban_until, until)
+            _time_limit_ban_trigger = trigger_sym
+            _stats["time_limit_ban_count"] += 1
+            label = "TIME_BAN"
+        elif kind == "PROFIT_GUARD":
+            _profit_guard_until = max(_profit_guard_until, until)
+            _profit_guard_trigger = trigger_sym
+            _stats["profit_guard_count"] += 1
+            label = "PROFIT_GUARD"
+        else:
+            return
+        active_until = {
+            "CASCADE_BAN": _cascade_ban_until,
+            "TIME_BAN": _time_limit_ban_until,
+            "PROFIT_GUARD": _profit_guard_until,
+        }[label]
+
+    print(f"  🛑 [{label}] {trigger_sym} — entry baru diblokir sampai {time.strftime('%H:%M:%S', time.localtime(active_until))}")
 
 def _estimate_floating_pnl(pos, price):
     try:
@@ -992,26 +1072,12 @@ def _mark_price_only(sym):
             return px
     return 0.0
 
-def _activate_sl_ban_and_liquidate(trigger_sym):
-    """Aktifkan ban 3 jam setelah SL dan tutup hanya posisi lain yang floating loss."""
-    global _sl_ban_until, _sl_ban_reason, _sl_ban_trigger, _sl_cascade_close_count
-
-    now = time.time()
-    with _sl_ban_lock:
-        _sl_ban_until = now + SL_BAN_SECONDS
-        _sl_ban_reason = "SL"
-        _sl_ban_trigger = trigger_sym
-        _stats["sl_ban_count"] += 1
-        ban_until_local = _sl_ban_until
-
-    print(f"\n  🛑 [SL CIRCUIT BAN] {trigger_sym} kena SL — trading baru DIKUNCI 3 JAM sampai {time.strftime('%H:%M:%S', time.localtime(ban_until_local))}")
-
-    if not SL_LIQUIDATE_LOSERS:
-        return
-
+def _liquidate_losing_positions(reason: str, exclude=None):
+    exclude = set(exclude or [])
     candidates = []
+
     for sym in list(live_positions.keys()):
-        if sym == trigger_sym:
+        if sym in exclude:
             continue
         pos = live_positions.get(sym)
         if pos is None or pos.get("_r"):
@@ -1024,7 +1090,7 @@ def _activate_sl_ban_and_liquidate(trigger_sym):
             except Exception:
                 px = 0.0
         if px <= 0:
-            print(f"  ⚠️ [SL LIQUIDATION] {sym}: harga floating tidak tersedia — posisi TIDAK dipaksa close")
+            print(f"  ⚠️ [{reason}] {sym}: harga floating tidak tersedia — posisi TIDAK dipaksa close")
             continue
 
         fpnl = _estimate_floating_pnl(pos, px)
@@ -1032,21 +1098,70 @@ def _activate_sl_ban_and_liquidate(trigger_sym):
             candidates.append((sym, px, fpnl))
         else:
             side = pos.get("side", "?")
-            print(f"  ✅ [SL LIQUIDATION] {sym} {side} dipertahankan | floating:{fpnl:+.5f}U (profit/non-loss)")
+            print(f"  ✅ [{reason}] {sym} {side} dipertahankan | floating:{fpnl:+.5f}U")
 
     for sym, px, fpnl in candidates:
-        print(f"  🔻 [SL LIQUIDATION] {sym} ditutup | floating:{fpnl:+.5f}U")
+        print(f"  🔻 [{reason}] {sym} ditutup | floating:{fpnl:+.5f}U")
         before = sym in live_positions
-        live_close(sym, "CASCADE_AFTER_SL", px)
-        if before and sym not in live_positions:
+        live_close(sym, reason, px)
+        if reason == "CASCADE_AFTER_SL" and before and sym not in live_positions:
+            global _sl_cascade_close_count
             _sl_cascade_close_count += 1
             _stats["sl_cascade_closes"] += 1
 
+    return len(candidates)
+
+def _activate_sl_ban_and_liquidate(trigger_sym):
+    """Aktifkan ban 3 jam setelah SL dan tutup hanya posisi lain yang floating loss."""
+    global _sl_ban_until, _sl_ban_reason, _sl_ban_trigger
+
+    now = time.time()
+    with _sl_ban_lock:
+        _sl_ban_until = max(_sl_ban_until, now + SL_BAN_SECONDS)
+        _sl_ban_reason = "SL"
+        _sl_ban_trigger = trigger_sym
+        _stats["sl_ban_count"] += 1
+        ban_until_local = _sl_ban_until
+
+    print(f"\n  🛑 [SL CIRCUIT BAN] {trigger_sym} kena SL — trading baru DIKUNCI 3 JAM sampai {time.strftime('%H:%M:%S', time.localtime(ban_until_local))}")
+
+    if SL_LIQUIDATE_LOSERS:
+        _liquidate_losing_positions("CASCADE_AFTER_SL", exclude={trigger_sym})
+
+def _maybe_activate_profit_guard():
+    global _profit_guard_triggered_ath, _profit_guard_in_progress
+
+    if not PROFIT_GUARD_ENABLED:
+        return
+
+    pnl = _stats["pnl"]
+    ath = _stats["ath_pnl"]
+    if ath < PROFIT_GUARD_ARM_PNL:
+        return
+    giveback = max(PROFIT_GUARD_GIVEBACK_MIN, ath * PROFIT_GUARD_GIVEBACK_PCT)
+    floor = ath - giveback
+    if pnl > floor:
+        return
+    if ath <= _profit_guard_triggered_ath + 1e-9:
+        return
+    if _profit_guard_in_progress:
+        return
+
+    _profit_guard_triggered_ath = ath
+    _profit_guard_in_progress = True
+    try:
+        _activate_aux_ban("PROFIT_GUARD", PROFIT_GUARD_BAN_SECONDS, "ATH_GIVEBACK")
+        print(f"  🧱 [PROFIT GUARD] PnL {pnl:+.4f}U turun dari ATH {ath:+.4f}U melewati floor {floor:+.4f}U | giveback:{ath-pnl:+.4f}U")
+        if PROFIT_GUARD_CLOSE_LOSERS:
+            _liquidate_losing_positions("PROFIT_GUARD")
+    finally:
+        _profit_guard_in_progress = False
+
 def ks_check():
     k, now = _ks, time.time()
-    sl_remaining = _sl_ban_remaining()
-    if sl_remaining > 0:
-        return True, f"SL_BAN({sl_remaining/3600:.2f}h)"
+    circuit, remaining = _circuit_snapshot()
+    if remaining > 0:
+        return True, circuit
     if _order_state_uncertain:
         return True, "ORDER_STATE_UNKNOWN — entry baru dihentikan"
     if k["active"] and now >= k["resume"]: k["active"], k["consec"] = False, 0
@@ -1258,24 +1373,77 @@ def live_close(sym, reason, price=None):
         _stats["losses"] += 1
         if pnl < _stats["worst"]: _stats["worst"] = pnl
 
-    # TRAILING STOP REMOVED: Hapus pencatatan exit karena trailing
-    if "SL" in reason: _stats["hard_sl"] += 1
-    elif "TP" in reason: _stats["tp_exit"] += 1
+    # Exit counters dipisahkan agar CASCADE_AFTER_SL tidak dihitung sebagai SL baru.
+    if reason == "SL": _stats["hard_sl"] += 1
+    elif reason == "TP": _stats["tp_exit"] += 1
 
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7), "exit": round(price, 7),
         "pnl": round(pnl, 5), "reason": reason, "hold": int(hold),
     })
 
-    # HANYA SL ASLI memicu ban 3 jam + likuidasi posisi lain yang sedang minus.
-    # TIME_LIMIT, TP, dan CASCADE_AFTER_SL tidak memicu ban baru.
+    # Circuit actions berdasarkan jenis exit.
     if reason == "SL":
         _activate_sl_ban_and_liquidate(sym)
+    elif reason == "CASCADE_AFTER_SL":
+        _activate_aux_ban("CASCADE", CASCADE_BAN_SECONDS, sym)
+    elif reason == "TIME_LIMIT":
+        _activate_aux_ban("TIME_LIMIT", TIME_LIMIT_BAN_SECONDS, sym)
+
+    _maybe_activate_profit_guard()
 
     with _lock: cooldown_list[sym] = time.time() + COOLDOWN_SEC
     _hot_syms.appendleft(sym)
     _rescan_q.put(1)
     print_inline()
+
+def _check_signal_flip_exit(sym, pos):
+    if not SIGNAL_FLIP_EXIT_ENABLED:
+        return False
+    if time.time() - pos.get("open_time", time.time()) < SIGNAL_FLIP_MIN_HOLD_SECONDS:
+        return False
+
+    with _kline_lock:
+        df = _kline_cache.get(sym)
+    if df is None or len(df) < 55:
+        return False
+
+    try:
+        candle_key = int(df.iloc[-2]["time"])
+    except Exception:
+        return False
+
+    if candle_key == pos.get("_signal_checked_candle"):
+        return False
+    pos["_signal_checked_candle"] = candle_key
+
+    try:
+        df_ta = run_ta(df.copy())
+        signal, score, _, _, regime, _ = scorer.get_signal(df_ta, sym)
+    except Exception as e:
+        _log_err(f"signal_flip_{sym}", e, cooldown=30)
+        return False
+
+    side = pos.get("side")
+    opposite = "SHORT" if side == "LONG" else "LONG"
+
+    if signal == opposite and score >= SIGNAL_FLIP_MIN_SCORE:
+        last_dir = pos.get("_flip_candidate")
+        count = pos.get("_flip_count", 0) + 1 if last_dir == signal else 1
+        pos["_flip_candidate"] = signal
+        pos["_flip_count"] = count
+
+        print(f"  🔄 [SIGNAL FLIP] {sym} {side} -> {signal} | score:{score:.0f} | regime:{regime} | confirm:{count}/{SIGNAL_FLIP_CONFIRM_CANDLES}")
+
+        if count >= SIGNAL_FLIP_CONFIRM_CANDLES:
+            _stats["signal_flip_exits"] += 1
+            live_close(sym, "SIGNAL_FLIP")
+            return True
+    else:
+        pos["_flip_candidate"] = None
+        pos["_flip_count"] = 0
+
+    return False
 
 def monitor_positions():
     for sym in list(live_positions.keys()):
@@ -1284,7 +1452,7 @@ def monitor_positions():
 
         hold_time = time.time() - pos["open_time"]
         if hold_time > MAX_HOLD_SECONDS:
-            print(f"  ⏰ {sym}: MAX_HOLD_SECONDS terlampaui ({hold_time:.0f}s) — TIME_LIMIT close")
+            print(f"  ⏰ {sym}: MAX_HOLD_SECONDS terlampaui ({hold_time:.0f}s) — TIME_LIMIT close + ban 1 jam")
             live_close(sym, "TIME_LIMIT")
             continue
 
@@ -1311,6 +1479,9 @@ def monitor_positions():
         elif side == "SHORT":
             if px <= tp_px: live_close(sym, "TP", tp_px); continue
             if px >= sl_px: live_close(sym, "SL", sl_px); continue
+
+        # Cut hanya jika candle 5m CLOSED memberikan sinyal lawan yang kuat.
+        _check_signal_flip_exit(sym, pos)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  6. SCANNER THREAD & HARD VETO FILTERS
@@ -1401,7 +1572,8 @@ def print_inline():
     e = "💚" if pnl >= 0 else "🔴"
     # TRAILING STOP REMOVED: Tampilan log ringkas diperbarui
     print(f"       ┌ [NORMAL ENGINE v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
-    print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Absorb:{_stats['absorb_entries']} | SL-Ban:{_stats['sl_ban_count']} Cascade:{_stats['sl_cascade_closes']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
+    circuit, _ = _circuit_snapshot()
+    print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Absorb:{_stats['absorb_entries']} | Circuit:{circuit or 'READY'} | Cascade:{_stats['sl_cascade_closes']} | FlipExit:{_stats['signal_flip_exits']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -1420,8 +1592,15 @@ def print_full():
     print(f"    {e} PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U | Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     # TRAILING STOP REMOVED: Log exit dashboard tanpa trailing stop
     print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']}")
-    sl_status = _sl_ban_status()
-    print(f"    🛑 SL Circuit: {sl_status if sl_status else 'READY'} | Bans:{_stats['sl_ban_count']} | Cascade Close:{_stats['sl_cascade_closes']}")
+    circuit, _ = _circuit_snapshot()
+    if _stats['ath_pnl'] >= PROFIT_GUARD_ARM_PNL:
+        giveback = max(PROFIT_GUARD_GIVEBACK_MIN, _stats['ath_pnl'] * PROFIT_GUARD_GIVEBACK_PCT)
+        profit_floor = _stats['ath_pnl'] - giveback
+        guard_info = f" | Floor:{profit_floor:+.3f}U"
+    else:
+        guard_info = ""
+    print(f"    🛑 Circuit: {circuit if circuit else 'READY'} | SL:{_stats['sl_ban_count']} | CascadeBan:{_stats['cascade_ban_count']} | TimeBan:{_stats['time_limit_ban_count']}")
+    print(f"    🧱 ProfitGuard:{_stats['profit_guard_count']} | FlipExit:{_stats['signal_flip_exits']} | Cascade Close:{_stats['sl_cascade_closes']} | ATH{guard_info}")
     print(f"    🛡️ Veto Stats: Wall Veto:{_stats['wall_veto']} | BTC Breaker:{_stats['btc_breaker_veto']} | Spoof:{_stats['spoof_veto']}")
     print(f"    ⚡ Absorption Entries: {_stats['absorb_entries']} | BEP WR:{bep:.1f}%")
 
@@ -1658,11 +1837,11 @@ def t_ws_watchdog():
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
     print("║  💎 BOT SCALPING v22.0 LIVE — NORMAL TRADING MODE                ║")
-    print("║  1. Signal LONG  -> Execute SHORT | Signal SHORT -> Execute LONG  ║")
-    print("║  2. TP = 2.5–3.5% (paper baseline / 3.5x ATR capped)              ║")
-    print("║  3. SL = 1.5–2.5% (paper baseline / 1.8x ATR capped)              ║")
-    print("║  4. SL = BAN 3 JAM + CLOSE POSISI LAIN YANG SEDANG LOSS           ║")
-    print("║  5. TP/TIME_LIMIT tidak memicu ban | Trailing Stop REMOVED        ║")
+    print("║  1. Signal LONG -> LONG | Signal SHORT -> SHORT                  ║")
+    print("║  2. TP = 2.5–3.5% (3.5x ATR capped)                              ║")
+    print("║  3. SL = 1.5–2.5% (1.8x ATR capped)                              ║")
+    print("║  4. SL = BAN 3 JAM + CLOSE POSISI LAIN YANG SEDANG LOSS          ║")
+    print("║  5. CASCADE/TIME_LIMIT = BAN 1 JAM | PROFIT GUARD aktif           ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try:
         valid = {s["symbol"] for s in _rest_call("startup_exchange_info", client.futures_exchange_info, retries=0)["symbols"] if s["status"] == "TRADING"}
@@ -1710,8 +1889,9 @@ def run_bot():
         btc_status = btc_macro.get_status_str()
         veto_summary = f"Veto[Wall:{_stats['wall_veto']}|BTC:{_stats['btc_breaker_veto']}|Spoof:{_stats['spoof_veto']}]"
 
-        sl_flag = f" | 🛑 {_sl_ban_status()}" if _sl_ban_status() else ""
-        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC_5M:{_macro['btc']} ({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U) | {veto_summary}{sl_flag}{api_flag}{ws_flag}")
+        circuit_status, _ = _circuit_snapshot()
+        circuit_flag = f" | 🛑 {circuit_status}" if circuit_status else ""
+        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC_5M:{_macro['btc']} ({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U) | {veto_summary}{circuit_flag}{api_flag}{ws_flag}")
         print(f"        ↳ {btc_status}")
 
         if (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}")
