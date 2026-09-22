@@ -24,6 +24,7 @@ if sys.platform == "win32":
 
 import os
 import time
+import inspect
 import math
 import threading
 import queue
@@ -49,10 +50,30 @@ except Exception:
     client = Client(api_key, api_secret)
 client.FUTURES_URL = "https://fapi.binance.com/fapi"
 
-try:
-    twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret)
-except Exception:
-    twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret)
+# WebSocket tuning. python-binance versions that support max_queue_size get a
+# larger per-socket queue; older versions are handled without breaking startup.
+WS_MAX_QUEUE_SIZE = 2000
+DEPTH_SOCKET_CHUNK = 8
+MARK_PRICE_FAST = False
+
+def _create_twm():
+    kwargs = {"api_key": api_key, "api_secret": api_secret}
+    try:
+        params = inspect.signature(ThreadedWebsocketManager.__init__).parameters
+        if "max_queue_size" in params:
+            kwargs["max_queue_size"] = WS_MAX_QUEUE_SIZE
+    except Exception:
+        pass
+    try:
+        return ThreadedWebsocketManager(**kwargs)
+    except TypeError:
+        kwargs.pop("max_queue_size", None)
+        return ThreadedWebsocketManager(**kwargs)
+    except Exception:
+        kwargs.pop("max_queue_size", None)
+        return ThreadedWebsocketManager(**kwargs)
+
+twm = _create_twm()
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION & INSTITUTIONAL PARAMETERS
@@ -60,7 +81,7 @@ except Exception:
 
 LEVERAGE      = 20
 ORDER_USDT    = 2.0
-MAX_POSITIONS = 2
+MAX_POSITIONS = 3
 
 # ── LOSS CIRCUIT / LOSS LIQUIDATION ────────────────────────────────────────
 SL_BAN_SECONDS = 3 * 60 * 60          # 3 jam setelah SL asli
@@ -1720,13 +1741,23 @@ def handle_mark_price(msg):
     global _ws_last_msg_ts
     try:
         _ws_last_msg_ts = time.time()
-        arr = msg if isinstance(msg, list) else [msg]
+        if isinstance(msg, dict) and "data" in msg:
+            data = msg.get("data")
+            arr = data if isinstance(data, list) else [data]
+        elif isinstance(msg, list):
+            arr = msg
+        else:
+            arr = [msg]
+
         now = time.time()
         for d in arr:
+            if not isinstance(d, dict):
+                continue
             sym, px = d.get("s"), d.get("p")
             if sym and px:
                 pf = float(px)
-                if pf > 0: _ws_mark_price[sym] = (pf, now)
+                if pf > 0:
+                    _ws_mark_price[sym] = (pf, now)
     except Exception as e:
         _log_err("handle_mark_price", e)
 
@@ -1836,6 +1867,7 @@ def t_ws_watchdog():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
+    print(f"║  WS protection: queue={WS_MAX_QUEUE_SIZE} | depth chunks={DEPTH_SOCKET_CHUNK} | mark fast={MARK_PRICE_FAST} ║")
     print("║  💎 BOT SCALPING v22.0 LIVE — NORMAL TRADING MODE                ║")
     print("║  1. Signal LONG -> LONG | Signal SHORT -> SHORT                  ║")
     print("║  2. TP = 2.5–3.5% (3.5x ATR capped)                              ║")
@@ -1853,16 +1885,27 @@ def run_bot():
     bootstrap_all_klines(syms)
 
     twm.start()
-    twm.start_all_mark_price_socket(callback=handle_mark_price, fast=True)
+
+    # Mark price: gunakan mode normal/lebih ringan. fast=True menghasilkan jauh
+    # lebih banyak pesan untuk semua simbol dan dapat memenuhi queue terlalu cepat.
+    twm.start_all_mark_price_socket(callback=handle_mark_price, fast=MARK_PRICE_FAST)
+
     twm.start_futures_multiplex_socket(callback=handle_all_ticker, streams=["!ticker@arr"])
-    
+
+    # Candle 5m sangat ringan, tetap satu multiplex socket.
     kline_streams = [f"{s.lower()}@kline_5m" for s in syms]
     twm.start_futures_multiplex_socket(callback=handle_kline_multiplex, streams=kline_streams)
-    
+
+    # BTC aggTrade dipisah sendiri agar tidak ikut antrean depth/mark-price.
     twm.start_futures_multiplex_socket(callback=handle_btc_aggtrade, streams=["btcusdt@aggtrade"])
-    
-    depth_streams = [f"{s.lower()}@depth10" for s in syms]
-    twm.start_futures_multiplex_socket(callback=handle_depth_multiplex, streams=depth_streams)
+
+    # Depth adalah sumber pesan terbesar. Pecah menjadi beberapa multiplex socket
+    # agar satu queue tidak menerima seluruh 40 simbol sekaligus.
+    for i in range(0, len(syms), DEPTH_SOCKET_CHUNK):
+        chunk = syms[i:i + DEPTH_SOCKET_CHUNK]
+        depth_streams = [f"{s.lower()}@depth10" for s in chunk]
+        twm.start_futures_multiplex_socket(callback=handle_depth_multiplex, streams=depth_streams)
+        time.sleep(0.15)
 
     try:
         twm.start_futures_user_socket(callback=handle_user_data)
