@@ -1,5 +1,5 @@
 """
-Bot Scalping v22.0 LIVE — INSTITUTIONAL QUANT ENGINE (Binance Futures)
+Bot Scalping v22.0 DEMO — INSTITUTIONAL QUANT ENGINE (Binance Futures)
 ====================================================================
 MODE NORMAL + CAPITAL PROTECTION
 - Signal Asli LONG  -> Eksekusi LONG
@@ -10,7 +10,7 @@ MODE NORMAL + CAPITAL PROTECTION
 - SL = ban 3 jam + liquidate posisi lain yang sedang floating loss
 - CASCADE_AFTER_SL = ban tambahan 1 jam (tidak memperpanjang SL 3 jam)
 - TIME_LIMIT = ban 1 jam
-- Profit Guard berbasis ATH PnL untuk mencegah giveback besar
+- Profit Guard dynamic berbasis ATH PnL; semakin besar ATH, semakin ketat proteksi giveback
 - Signal Flip Exit: cut setelah candle 5m closed mengonfirmasi arah berlawanan kuat
 """
 
@@ -48,7 +48,13 @@ try:
     client = Client(api_key, api_secret)
 except Exception:
     client = Client(api_key, api_secret)
-client.FUTURES_URL = "https://fapi.binance.com/fapi"
+# BINANCE FUTURES DEMO / TESTNET — HARD SAFETY LOCK
+# Semua REST Futures diarahkan ke environment demo, bukan akun real.
+BINANCE_DEMO = False
+if BINANCE_DEMO:
+    client.FUTURES_URL = "https://demo-fapi.binance.com/fapi"
+else:
+    client.FUTURES_URL = "https://fapi.binance.com/fapi"
 
 # WebSocket tuning. python-binance versions that support max_queue_size get a
 # larger per-socket queue; older versions are handled without breaking startup.
@@ -91,9 +97,14 @@ SL_LIQUIDATE_LOSERS = True             # Saat SL: tutup posisi lain yang floatin
 
 # ── PROFIT GUARD / ATH GIVEBACK PROTECTION ──────────────────────────────────
 PROFIT_GUARD_ENABLED = True
-PROFIT_GUARD_ARM_PNL = 1.50             # Guard mulai bisa aktif setelah cumulative PnL >= +1.50U
-PROFIT_GUARD_GIVEBACK_MIN = 1.00        # Minimal giveback yang ditoleransi dari ATH
-PROFIT_GUARD_GIVEBACK_PCT = 0.30        # atau 30% dari ATH, ambil yang lebih besar
+PROFIT_GUARD_ARM_PNL = 1.50             # Mulai melindungi profit setelah ATH mencapai +1.50U
+# Dynamic ATH giveback: semakin besar ATH, semakin kecil persentase profit
+# yang boleh dikembalikan. Tidak ada hard ceiling; guard terus mengikuti ATH.
+PROFIT_GUARD_GIVEBACK_PCT_LOW = 0.40    # ATH 1.50–2.50U -> toleransi giveback 40%
+PROFIT_GUARD_GIVEBACK_PCT_MID = 0.35    # ATH 2.50–5.00U  -> toleransi giveback 35%
+PROFIT_GUARD_GIVEBACK_PCT_HIGH = 0.30   # ATH 5.00–10.00U -> toleransi giveback 30%
+PROFIT_GUARD_GIVEBACK_PCT_MAX = 0.20    # ATH >=10U -> toleransi giveback 20%
+PROFIT_GUARD_GIVEBACK_MIN = 0.50        # Batas minimum giveback nominal; bukan lagi $1 tetap
 PROFIT_GUARD_BAN_SECONDS = 2 * 60 * 60  # 2 jam blok entry baru
 PROFIT_GUARD_CLOSE_LOSERS = True       # Saat guard aktif, close posisi lain yang floating loss
 
@@ -1159,7 +1170,18 @@ def _maybe_activate_profit_guard():
     ath = _stats["ath_pnl"]
     if ath < PROFIT_GUARD_ARM_PNL:
         return
-    giveback = max(PROFIT_GUARD_GIVEBACK_MIN, ath * PROFIT_GUARD_GIVEBACK_PCT)
+    # Dynamic giveback berdasarkan besarnya ATH. Guard tidak berhenti di +1.50U;
+    # setelah ATH naik, floor ikut naik dan toleransi giveback makin ketat.
+    if ath < 2.50:
+        giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_LOW
+    elif ath < 5.00:
+        giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_MID
+    elif ath < 10.00:
+        giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_HIGH
+    else:
+        giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_MAX
+
+    giveback = max(PROFIT_GUARD_GIVEBACK_MIN, ath * giveback_pct)
     floor = ath - giveback
     if pnl > floor:
         return
@@ -1615,9 +1637,18 @@ def print_full():
     print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']}")
     circuit, _ = _circuit_snapshot()
     if _stats['ath_pnl'] >= PROFIT_GUARD_ARM_PNL:
-        giveback = max(PROFIT_GUARD_GIVEBACK_MIN, _stats['ath_pnl'] * PROFIT_GUARD_GIVEBACK_PCT)
-        profit_floor = _stats['ath_pnl'] - giveback
-        guard_info = f" | Floor:{profit_floor:+.3f}U"
+        ath = _stats['ath_pnl']
+        if ath < 2.50:
+            giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_LOW
+        elif ath < 5.00:
+            giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_MID
+        elif ath < 10.00:
+            giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_HIGH
+        else:
+            giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_MAX
+        giveback = max(PROFIT_GUARD_GIVEBACK_MIN, ath * giveback_pct)
+        profit_floor = ath - giveback
+        guard_info = f" | Floor:{profit_floor:+.3f}U ({giveback_pct:.0%} GB)"
     else:
         guard_info = ""
     print(f"    🛑 Circuit: {circuit if circuit else 'READY'} | SL:{_stats['sl_ban_count']} | CascadeBan:{_stats['cascade_ban_count']} | TimeBan:{_stats['time_limit_ban_count']}")
