@@ -12,6 +12,7 @@ MODE NORMAL + CAPITAL PROTECTION
 - TIME_LIMIT = ban 1 jam
 - Profit Guard dynamic berbasis ATH PnL; semakin besar ATH, semakin ketat proteksi giveback
 - Signal Flip Exit: cut setelah candle 5m closed mengonfirmasi arah berlawanan kuat
+- ORDER_STATE_UNKNOWN = auto-reconcile posisi akun sebelum memblokir entry permanen
 """
 
 import sys
@@ -731,6 +732,11 @@ _rest_price_cache = {}
 _rest_ticker_stale_until = 0.0
 _leverage_done = set()
 _order_state_uncertain = False
+_order_state_reason = ""
+_order_state_since = 0.0
+_order_state_last_check = 0.0
+_order_state_ctx = {}
+ORDER_STATE_RECONCILE_SEC = 5.0
 _sl_ban_lock = threading.Lock()
 _sl_ban_until = 0.0
 _sl_ban_reason = ""
@@ -822,8 +828,170 @@ def _rest_call(tag, fn, *args, retries=1, **kwargs):
 def _new_client_order_id(prefix, sym):
     return f"IV22_{prefix}_{sym}_{int(time.time()*1000)%1000000000}"[:32]
 
-def _create_market_order_safe(sym, side, quantity, reduce_only=False):
-    """Tidak me-retry POST order; gunakan clientOrderId untuk verifikasi bila perlu."""
+def _position_snapshot(sym):
+    """Ambil posisi aktual Binance untuk rekonsiliasi order yang statusnya ambigu."""
+    data = _rest_call(
+        f"reconcile_position_{sym}",
+        client.futures_position_information,
+        symbol=sym,
+        retries=0,
+    )
+    if isinstance(data, dict):
+        data = [data]
+    for p in data or []:
+        if p.get("symbol") != sym:
+            continue
+        return {
+            "amt": float(p.get("positionAmt", 0) or 0),
+            "entry": float(p.get("entryPrice", 0) or 0),
+            "mark": float(p.get("markPrice", 0) or 0),
+            "unrealized": float(p.get("unRealizedProfit", 0) or 0),
+        }
+    return {"amt": 0.0, "entry": 0.0, "mark": 0.0, "unrealized": 0.0}
+
+
+def _clear_order_state():
+    global _order_state_uncertain, _order_state_reason, _order_state_since
+    global _order_state_last_check, _order_state_ctx
+    _order_state_uncertain = False
+    _order_state_reason = ""
+    _order_state_since = 0.0
+    _order_state_last_check = 0.0
+    _order_state_ctx = {}
+
+
+def _set_order_state_uncertain(sym, side, quantity, reduce_only, cid, context=None, reason=""):
+    global _order_state_uncertain, _order_state_reason, _order_state_since
+    global _order_state_last_check, _order_state_ctx
+    _order_state_uncertain = True
+    _order_state_reason = reason or f"ORDER STATUS UNKNOWN {sym} clientOrderId={cid}"
+    _order_state_since = time.time()
+    _order_state_last_check = 0.0
+    _order_state_ctx = {
+        "sym": sym,
+        "side": side,
+        "quantity": float(quantity),
+        "reduce_only": bool(reduce_only),
+        "client_order_id": cid,
+        "context": dict(context or {}),
+    }
+
+
+def _reconcile_uncertain_order(create_result=False):
+    """Coba pastikan order ambigu sudah/ belum mengubah posisi; tidak mengulang POST."""
+    global _order_state_last_check
+    if not _order_state_uncertain or not _order_state_ctx:
+        return False
+
+    now = time.time()
+    if now - _order_state_last_check < ORDER_STATE_RECONCILE_SEC:
+        return False
+    _order_state_last_check = now
+
+    ctx = dict(_order_state_ctx)
+    sym = ctx.get("sym")
+    side = ctx.get("side")
+    qty_req = float(ctx.get("quantity", 0) or 0)
+    reduce_only = bool(ctx.get("reduce_only"))
+    template = dict(ctx.get("context") or {})
+
+    if not sym or qty_req <= 0:
+        return False
+
+    try:
+        # Pertama: cari order dengan clientOrderId yang sama.
+        found = _rest_call(
+            f"reconcile_order_{sym}",
+            client.futures_get_order,
+            symbol=sym,
+            origClientOrderId=ctx.get("client_order_id"),
+            retries=0,
+        )
+        if found:
+            status = str(found.get("status", "")).upper()
+            if status in ("FILLED", "PARTIALLY_FILLED"):
+                if reduce_only:
+                    _clear_order_state()
+                    return True
+                try:
+                    snap = _position_snapshot(sym)
+                    amt = float(snap.get("amt", 0) or 0)
+                    entry_px = snap.get("entry", 0.0) or snap.get("mark", 0.0)
+                    if abs(amt) > 1e-12 and entry_px > 0:
+                        template.setdefault("side", "LONG" if amt > 0 else "SHORT")
+                        template.update({
+                            "entry": entry_px,
+                            "qty": abs(amt),
+                            "open_time": template.get("open_time", time.time()),
+                            "peak_price": entry_px,
+                        })
+                        with _lock:
+                            live_positions[sym] = template
+                    _clear_order_state()
+                    return True
+                except Exception:
+                    return False
+            if status in ("CANCELED", "EXPIRED", "REJECTED"):
+                _clear_order_state()
+                return True
+    except Exception:
+        pass
+
+    try:
+        snap = _position_snapshot(sym)
+        amt = float(snap.get("amt", 0) or 0)
+
+        if reduce_only:
+            # Posisi sudah 0 berarti close berhasil walaupun response order hilang.
+            if abs(amt) <= 1e-12:
+                _clear_order_state()
+                return True
+
+            # Posisi masih ada berarti close belum tuntas / hanya parsial.
+            # Sinkronkan qty bot dengan posisi aktual, lalu izinkan monitoring lanjut.
+            if sym in live_positions and not live_positions[sym].get("_r"):
+                live_positions[sym]["qty"] = abs(amt)
+                if snap.get("entry", 0) > 0:
+                    live_positions[sym]["entry"] = float(snap["entry"])
+            _clear_order_state()
+            return True
+
+        # Opening order: posisi aktual harus searah dengan BUY/SELL.
+        if abs(amt) > 1e-12:
+            expected_sign = 1.0 if side == "BUY" else -1.0
+            if math.copysign(1.0, amt) == expected_sign:
+                # Bentuk response sintetis dari state akun aktual.
+                entry_px = snap.get("entry", 0.0) or snap.get("mark", 0.0)
+                if entry_px <= 0:
+                    return False
+                template.setdefault("side", "LONG" if amt > 0 else "SHORT")
+                template.update({
+                    "entry": entry_px,
+                    "qty": abs(amt),
+                    "open_time": template.get("open_time", time.time()),
+                    "peak_price": entry_px,
+                })
+                with _lock:
+                    live_positions[sym] = template
+                _clear_order_state()
+                return {
+                    "orderId": "RECONCILED",
+                    "status": "FILLED",
+                    "executedQty": abs(amt),
+                    "avgPrice": entry_px,
+                }
+
+        # Tidak ada posisi berarti order entry ambigu kemungkinan tidak pernah fill.
+        # Aman untuk membuka kembali nanti; jangan spam POST saat ini.
+        _clear_order_state()
+        return True
+    except Exception as e:
+        _log_warn("order_state_reconcile", f"{sym}: rekonsiliasi belum dapat dipastikan: {e}", cooldown=15)
+        return False
+
+
+def _create_market_order_safe(sym, side, quantity, reduce_only=False, context=None):
+    """Tidak me-retry POST order; verifikasi/reconcile state bila response ambigu."""
     global _order_state_uncertain
     cid = _new_client_order_id("C" if reduce_only else "O", sym)
     kwargs = {
@@ -838,14 +1006,16 @@ def _create_market_order_safe(sym, side, quantity, reduce_only=False):
         kwargs["reduceOnly"] = True
 
     try:
-        return _rest_call(f"create_order_{sym}", client.futures_create_order, retries=0, **kwargs)
+        result = _rest_call(f"create_order_{sym}", client.futures_create_order, retries=0, **kwargs)
+        if _order_state_uncertain:
+            _clear_order_state()
+        return result
     except Exception as first_exc:
         text = str(first_exc).upper()
-        # 403/429/418 are rejected by the API/WAF layer; do not duplicate the POST.
         if "403" in text or "429" in text or "418" in text or "CLOUDFRONT" in text:
             raise
 
-        # For ambiguous network/5xx errors, query by clientOrderId exactly once.
+        # Verifikasi dengan clientOrderId sekali; tidak mengulang POST.
         try:
             time.sleep(0.5)
             found = _rest_call(
@@ -856,12 +1026,53 @@ def _create_market_order_safe(sym, side, quantity, reduce_only=False):
                 retries=0,
             )
             if found:
+                _clear_order_state()
                 return found
         except Exception:
             pass
 
-        _order_state_uncertain = True
-        raise RuntimeError(f"ORDER STATUS UNKNOWN {sym} clientOrderId={cid}: {first_exc}") from first_exc
+        # Rekonsiliasi posisi aktual. Ini penting agar satu timeout/network error
+        # tidak membuat bot berhenti entry selamanya.
+        try:
+            ctx = dict(context or {})
+            snap = _position_snapshot(sym)
+            amt = float(snap.get("amt", 0) or 0)
+
+            if reduce_only and abs(amt) <= 1e-12:
+                _clear_order_state()
+                return {
+                    "orderId": "RECONCILED",
+                    "status": "FILLED",
+                    "executedQty": quantity,
+                    "avgPrice": snap.get("mark", 0.0),
+                }
+
+            if not reduce_only:
+                expected_sign = 1.0 if side == "BUY" else -1.0
+                if abs(amt) > 1e-12 and math.copysign(1.0, amt) == expected_sign:
+                    entry_px = snap.get("entry", 0.0) or snap.get("mark", 0.0)
+                    if entry_px > 0:
+                        _clear_order_state()
+                        return {
+                            "orderId": "RECONCILED",
+                            "status": "FILLED",
+                            "executedQty": abs(amt),
+                            "avgPrice": entry_px,
+                        }
+
+            _set_order_state_uncertain(
+                sym, side, quantity, reduce_only, cid,
+                context=ctx,
+                reason=f"ORDER STATUS UNKNOWN {sym} clientOrderId={cid}: {first_exc}",
+            )
+        except Exception as reconcile_exc:
+            _set_order_state_uncertain(
+                sym, side, quantity, reduce_only, cid,
+                context=dict(context or {}),
+                reason=f"ORDER STATUS UNKNOWN {sym} clientOrderId={cid}: {first_exc} | reconcile:{reconcile_exc}",
+            )
+
+        raise RuntimeError(_order_state_reason) from first_exc
 
 def _get_order_fill(order):
     try:
@@ -1206,7 +1417,11 @@ def ks_check():
     if remaining > 0:
         return True, circuit
     if _order_state_uncertain:
-        return True, "ORDER_STATE_UNKNOWN — entry baru dihentikan"
+        if _reconcile_uncertain_order():
+            if _order_state_uncertain:
+                return True, "ORDER_STATE_UNKNOWN — entry baru dihentikan"
+        else:
+            return True, "ORDER_STATE_UNKNOWN — entry baru dihentikan"
     if k["active"] and now >= k["resume"]: k["active"], k["consec"] = False, 0
     if k["active"]: return True, k["reason"]
     day = now - (now % 86400)
@@ -1308,6 +1523,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
             'BUY' if execution_side == 'LONG' else 'SELL',
             q_val,
             reduce_only=False,
+            context=pos,
         )
         filled_qty, real_px = _get_order_fill(order)
         if filled_qty <= 0:
