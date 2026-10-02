@@ -8,6 +8,7 @@ DYNAMIC LOGIC TOGGLE MODE (NORMAL <-> INVERTED):
 - MAX_POSITIONS = 1
 - ORDER_USDT = 3.0 USDT
 - NO BANS, NO SIGNAL FLIP, NO CASCADE LIQUIDATION
+- INCLUDES LAST 5 TRADES HISTORY IN DASHBOARD
 """
 
 import sys
@@ -291,7 +292,6 @@ class BTCMacroEngine:
                 if now < self.breaker["until"]:
                     rem = self.breaker["until"] - now
                     b_type = self.breaker["type"]
-                    delta = self.breaker["delta"]
                     if b_type == "CRASH" and side == "LONG":
                         return True, f"BTC Flash Crash active ({rem:.0f}s left)"
                     elif b_type == "PUMP" and side == "SHORT":
@@ -962,15 +962,15 @@ def live_close(sym, reason, price=None):
     e_icon = "🟢" if won else "🔴"
 
     # ═══════════════════════════════════════════════════════════════════════════
-    #  LOGIKA INTEGRASI TOGGLE INVERT / NORMAL MULTI-LOSS
+    #  LOGIKA TOGGLE INVERT / NORMAL MULTI-LOSS (SL & TIME_LIMIT MINUS)
     # ═══════════════════════════════════════════════════════════════════════════
     if not won:  # Mengalami Loss (Kemungkinan dari SL atau TIME_LIMIT pnl < 0)
         is_logic_inverted = not is_logic_inverted  # Toggle mode logika
         next_mode = "INVERTED" if is_logic_inverted else "NORMAL"
-        print(f"  🔄 [LOGIC TOGGLE] Posisi MINUS/LOSS! Logika Bot Berganti Mode ke: {next_mode}")
+        print(f"  🔄 [LOGIC TOGGLE] Posisi MINUS/LOSS ({pnl:+.4f}U)! Logika Bot Berganti Mode ke: {next_mode}")
     else:
         current_mode = "INVERTED" if is_logic_inverted else "NORMAL"
-        print(f"  ✅ [LOGIC STABLE] Posisi PROFIT! Logika Tetap Bertahan di Mode: {current_mode}")
+        print(f"  ✅ [LOGIC STABLE] Posisi PROFIT ({pnl:+.4f}U)! Logika Tetap Bertahan di Mode: {current_mode}")
     # ═══════════════════════════════════════════════════════════════════════════
 
     print(
@@ -1006,6 +1006,7 @@ def live_close(sym, reason, price=None):
     elif reason == "TP": _stats["tp_exit"] += 1
     elif reason == "TIME_LIMIT": _stats["time_limit_exit"] += 1
 
+    # CATAT RIWAYAT TRADING LENGKAP
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7),
         "exit": round(price, 7), "pnl": round(pnl, 5),
@@ -1118,11 +1119,19 @@ def print_full():
     wr = _stats["wins"] / n * 100 if n else 0
     pnl = _stats["pnl"]
     mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
+    
     print(f"\n  {'─'*72}")
     print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD (MODE LOGIKA: {mode_str})")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"    PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U")
     print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | TimeLimit:{_stats['time_limit_exit']}")
+
+    # RIWAYAT 5 KOIN/TOKEN TERAKHIR DITAMPILKAN DI SINI
+    if trade_log:
+        print(f"    {'─'*62}\n    📋 Last 5:")
+        for t in trade_log[-5:]:
+            em = "🟢" if t["pnl"] >= 0 else "🔴"
+            print(f"        {em} {t['sym']:<16} {t['side']} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
     print(f"  {'─'*72}")
 
 def t_monitor():
@@ -1267,6 +1276,7 @@ def run_bot():
     print("║  2. Jika Loss (SL/TimeLimit < 0) -> TOGGLE Invert/Normal           ║")
     print("║  3. Jika Profit (TP/TimeLimit >= 0) -> Logika Tetap               ║")
     print("║  4. Margin = $3.0 | Max Position = 1 | No Ban & No Signal Flip     ║")
+    print("║  5. History 5 Koin Terakhir Aktif di Dashboard                     ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     
     try:
